@@ -1,0 +1,22 @@
+:root {
+  color-scheme: dark;
+  --page: #100f17;
+  --text: #f4f0fa;
+  --muted: #aaa3b5;
+  --line: #302b3a;
+  --purple: #9568eb;
+  --purple-light: #b899fa;
+}
+
+* { box-sizing: border-box; }
+html, body { background: var(--page); margin: 0; min-height: 100%; }
+body {
+  background:
+    radial-gradient(ellipse 800px 400px at 50% -160px, #412b681c, transparent 70%),
+    var(--page);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input { font: inherit; }
+::selection { background: #8d68d777; color: #fff; }

@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: stream2song-backend
+
+server:
+  port: 8080
+  servlet:
+    session:
+      cookie:
+        http-only: true
+        same-site: lax
+        secure: ${TWITCH_SESSION_COOKIE_SECURE:false}
+
+twitch:
+  client-id: ${TWITCH_CLIENT_ID:}
+  client-secret: ${TWITCH_CLIENT_SECRET:}
+  redirect-uri: ${TWITCH_OAUTH_REDIRECT_URI:}
+  frontend-base-url: ${TWITCH_FRONTEND_BASE_URL:http://localhost:4200}
+  eventsub:
+    callback-url: ${TWITCH_EVENTSUB_CALLBACK_URL:}
+    signing-secret: ${TWITCH_EVENTSUB_SIGNING_SECRET:}

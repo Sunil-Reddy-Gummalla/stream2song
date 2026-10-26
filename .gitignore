@@ -1,0 +1,22 @@
+# Node / Angular
+node_modules/
+frontend/dist/
+frontend/.angular/
+frontend/out-tsc/
+npm-debug.log*
+
+# Java / Maven
+backend/target/
+*.class
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!backend/.env.example
+application-local.yml
