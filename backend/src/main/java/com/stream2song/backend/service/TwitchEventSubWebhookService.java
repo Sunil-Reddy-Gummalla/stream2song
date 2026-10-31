@@ -9,6 +9,9 @@ import java.util.HexFormat;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -23,6 +26,7 @@ import com.stream2song.backend.model.StreamSessionState;
 
 @Service
 public class TwitchEventSubWebhookService {
+    private static final Logger log = LoggerFactory.getLogger(TwitchEventSubWebhookService.class);
     private static final Duration MESSAGE_ID_RETENTION = Duration.ofHours(24);
     private static final String HMAC_PREFIX = "sha256=";
 
@@ -172,6 +176,7 @@ public class TwitchEventSubWebhookService {
                 throw failure(HttpStatus.BAD_REQUEST, "eventsub_revocation_invalid");
             }
             subscriptionRegistry.markRevoked(id, reason);
+            log.info("Twitch EventSub subscription revoked: subscriptionId={} reason={}", id, reason);
         }
     }
 

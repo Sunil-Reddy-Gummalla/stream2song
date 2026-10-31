@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "start": "ng serve --proxy-config proxy.conf.json",
-    "build": "ng build"
+    "build": "ng build",
+    "test:twitch-status": "node --test src/app/features/twitch/twitch-subscription-status.test.mjs src/app/features/twitch/clip-transcription-error.test.mjs src/app/features/twitch/memorable-moments-error.test.mjs src/app/features/twitch/clip-analysis-epochs.test.mjs src/app/features/twitch/clip-lyrics-format.test.mjs src/app/features/twitch/music-job-error.test.mjs src/app/features/twitch/music-job-polling.test.mjs src/app/features/twitch/spoken-preview.test.mjs src/app/features/twitch/clip-pipeline.test.mjs src/app/features/twitch/clip-request-subscriptions.test.mjs"
   },
   "dependencies": {
     "@angular/common": "^22.2.0",

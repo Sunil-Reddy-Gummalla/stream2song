@@ -8,6 +8,7 @@ npm-debug.log*
 # Java / Maven
 backend/target/
 *.class
+backend/logs/
 
 # IDE and OS
 .idea/

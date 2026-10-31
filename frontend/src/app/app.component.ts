@@ -1,16 +1,30 @@
 import { DatePipe } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
-import { Component, OnInit, computed, inject, signal } from '@angular/core';
+import { Component, OnDestroy, OnInit, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { finalize } from 'rxjs';
-import { SongJob } from './features/songs/song-job.model';
-import { SongsApiService } from './features/songs/songs-api.service';
+import { Observable, Subscription, finalize } from 'rxjs';
 import { TwitchApiService } from './features/twitch/twitch-api.service';
 import { TwitchConnectionStatus } from './features/twitch/twitch-connection.model';
 import { TwitchStreamSession } from './features/twitch/twitch-stream-session.model';
+import { streamSubscriptionDisplay } from './features/twitch/twitch-subscription-status';
 import { TwitchChatMessage, TwitchChatSummary } from './features/twitch/twitch-chat.model';
+import { TwitchClip, TwitchClipsResponse } from './features/twitch/twitch-clip.model';
+import { ClipTranscriptionResponse } from './features/twitch/clip-transcription.model';
+import { clipTranscriptionErrorMessage } from './features/twitch/clip-transcription-error';
+import { MemorableMomentsResponse, MemorableMoment } from './features/twitch/memorable-moments.model';
+import { memorableMomentsErrorMessage, momentInterpretationErrorMessage } from './features/twitch/memorable-moments-error';
+import { MomentInterpretationResponse } from './features/twitch/moment-interpretation.model';
+import { ClipAnalysisEpochs } from './features/twitch/clip-analysis-epochs';
+import { ClipRequestSubscriptions } from './features/twitch/clip-request-subscriptions';
+import { ClipLyricsRequest, ClipLyricsResponse, LyricsEnergy, LyricsGenre, LyricsMood } from './features/twitch/clip-lyrics.model';
+import { clipLyricsErrorMessage, formatClipLyricsForCopy, isCurrentLyricsRequest } from './features/twitch/clip-lyrics-format';
+import { MusicJobResponse, canResumeMusicStatus, isCurrentMusicJobRequest, isTerminalMusicJob } from './features/twitch/music-job.model';
+import { musicCreateSafeMessage, musicJobSafeMessage } from './features/twitch/music-job-error';
+import { pollMusicJob } from './features/twitch/music-job-polling';
+import { SpokenPreviewAudioRegistry, canGenerateSpokenPreview, isCurrentSpokenPreview, spokenPreviewSafeMessage } from './features/twitch/spoken-preview';
+import { ClipPipelineCancelled, ClipPipelineFailure, ClipPipelineStage, canStartClipPipeline, clipPipelineStageLabel, invalidateRemovedClipSources, runClipPipeline } from './features/twitch/clip-pipeline';
 
-const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
+type ManualClipRequestKind = 'transcription' | 'moments' | 'interpretation' | 'lyrics';
 
 @Component({
   selector: 'app-root',
@@ -25,7 +39,7 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
         </a>
         <div class="header-copy">
           <span>Turn your Twitch streams into songs</span>
-          <span class="demo-badge"><span></span> Project preview</span>
+          <span class="demo-badge"><span></span> Clip workflow</span>
         </div>
       </header>
 
@@ -35,7 +49,7 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
             <p class="eyebrow"><span class="eyebrow-line"></span> YOUR STREAM, REMIXED</p>
             <h1 id="hero-title">Your best moments.<br><span>In a different key.</span></h1>
             <p class="hero-description">
-              Start a song project from your channel. We’ll keep track of your request here while the generation workflow is being built.
+              Connect Twitch, choose a clip, and turn its memorable moments into lyrics and a spoken preview. You can also request a generated song from a finished lyric draft.
             </p>
           </div>
           <div class="hero-art" aria-hidden="true">
@@ -89,7 +103,8 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
                 @if (twitchSession()?.connected) {
                   <div class="chat-summary" aria-live="polite">
                     <span class="chat-count">Chat · {{ chatSummary()?.totalMessages ?? 0 }} messages</span>
-                    <span class="chat-state" [class.chat-active]="chatSummary()?.collecting">
+                    <span class="chat-state" [class.chat-active]="chatSummary()?.collecting"
+                      [class.chat-error]="chatStatusIsError(chatSummary()?.collectionStatus)">
                       {{ chatStatusLabel(chatSummary()?.collectionStatus) }}
                     </span>
                   </div>
@@ -111,147 +126,234 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
                     <span class="stream-hint">No chat messages collected for this stream yet.</span>
                   }
                 }
-                @if (twitchSession()?.subscriptionStatuses?.['stream.online'] === 'not_configured'
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline'] === 'not_configured') {
-                  <span class="stream-hint">Configure the public HTTPS EventSub callback and signing secret in the backend.</span>
-                } @else if (twitchSession()?.subscriptionStatuses?.['stream.online'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['channel.chat.message'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['channel.chat.message'] === 'authorization_required') {
-                  <span class="stream-hint error">Twitch EventSub setup failed. Check backend configuration and reconnect.</span>
-                } @else if (twitchSession()?.subscriptionStatuses?.['stream.online']?.startsWith('revoked:')
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline']?.startsWith('revoked:')) {
-                  <span class="stream-hint error">Twitch revoked a stream subscription. Reconnect to retry setup.</span>
-                } @else if (twitchSession()?.subscriptionStatuses?.['stream.online'] === 'webhook_callback_verification_pending'
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline'] === 'webhook_callback_verification_pending') {
-                  <span class="stream-hint">Waiting for Twitch to verify the webhook callback.</span>
+                @if (streamEventSubDisplay(); as eventSub) {
+                  <span class="stream-hint" [class.error]="eventSub.error">
+                    <strong>{{ eventSub.label }}.</strong> {{ eventSub.description }}
+                  </span>
                 }
-                @if (twitchSession()?.subscriptionStatuses?.['stream.online'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['channel.chat.message'] === 'failed'
-                  || twitchSession()?.subscriptionStatuses?.['channel.chat.message'] === 'authorization_required'
-                  || twitchSession()?.subscriptionStatuses?.['stream.online']?.startsWith('revoked:')
-                  || twitchSession()?.subscriptionStatuses?.['stream.offline']?.startsWith('revoked:')) {
-                  <a class="session-refresh" [href]="twitchConnectUrl">Retry connection</a>
+                @if (streamEventSubDisplay()?.error && streamEventSubDisplay()?.state !== 'conflict_unresolved') {
+                  <a class="session-refresh" [href]="twitchConnectUrl">Retry EventSub setup</a>
                 }
                 <button class="session-refresh" type="button" (click)="loadTwitchSession(true)" [disabled]="twitchSessionLoading()">{{ twitchSessionLoading() ? 'Refreshing…' : 'Refresh status' }}</button>
               </div>
-            }
-          </section>
-
-          <section class="panel create-panel" aria-labelledby="create-title">
-            <div class="panel-heading">
-              <div class="heading-icon create-icon" aria-hidden="true">♫</div>
-              <div>
-                <p class="panel-kicker">GET STARTED</p>
-                <h2 id="create-title">Create a song project</h2>
-              </div>
-            </div>
-            <p class="panel-description">Enter your Twitch channel name to start a new project.</p>
-
-            <form (ngSubmit)="createSong()" novalidate>
-              <label for="channel-name">Twitch channel name</label>
-              <div class="input-wrap" [class.input-error]="showChannelError()">
-                <span class="input-at" aria-hidden="true">@</span>
-                <input
-                  id="channel-name"
-                  name="channelName"
-                  type="text"
-                  autocomplete="off"
-                  autocapitalize="none"
-                  spellcheck="false"
-                  maxlength="25"
-                  placeholder="your_channel"
-                  [ngModel]="channelName()"
-                  (ngModelChange)="onChannelNameChange($event)"
-                  (blur)="channelTouched.set(true)"
-                  [attr.aria-invalid]="showChannelError()"
-                  aria-describedby="channel-hint channel-error"
-                >
-              </div>
-              <div class="field-notes">
-                <span id="channel-hint">4–25 letters, numbers, or underscores</span>
-                <span class="character-count">{{ channelName().length }}/25</span>
-              </div>
-              @if (showChannelError()) {
-                <p id="channel-error" class="field-error" role="alert">{{ channelErrorMessage() }}</p>
-              }
-
-              <button class="primary-button" type="submit" [disabled]="submitting()">
-                @if (submitting()) {
-                  <span class="spinner" aria-hidden="true"></span>
-                  Creating project…
-                } @else {
-                  <span aria-hidden="true">✦</span>
-                  Generate My Song
-                  <span class="button-arrow" aria-hidden="true">→</span>
-                }
-              </button>
-            </form>
-
-            @if (successMessage()) {
-              <div class="notice notice-success" role="status">
-                <span class="notice-icon" aria-hidden="true">✓</span>
-                <span>{{ successMessage() }}</span>
-              </div>
-            }
-            @if (createError()) {
-              <div class="notice notice-error" role="alert">
-                <span class="notice-icon" aria-hidden="true">!</span>
-                <span>{{ createError() }}</span>
-              </div>
-            }
-            <p class="honest-note"><span aria-hidden="true">ⓘ</span> This creates a project request. Song generation is not active yet.</p>
-          </section>
-
-          <section class="panel jobs-panel" aria-labelledby="jobs-title">
-            <div class="jobs-heading">
-              <div class="panel-heading">
-                <div class="heading-icon jobs-icon" aria-hidden="true">▤</div>
-                <div>
-                  <p class="panel-kicker">YOUR WORKSPACE</p>
-                  <h2 id="jobs-title">Song projects <span class="job-count">{{ jobs().length }}</span></h2>
+              <section class="clips-section" aria-labelledby="clips-title">
+                <div class="clips-heading">
+                  <h3 id="clips-title">Recent Twitch clips</h3>
+                  @if (clipsPage()?.associationNote) { <span class="stream-hint">{{ clipsPage()?.associationNote }}</span> }
                 </div>
-              </div>
-              <button class="refresh-button" type="button" (click)="loadJobs()" [disabled]="jobsLoading()" aria-label="Refresh song projects" title="Refresh projects">
-                <span [class.spinning]="jobsLoading()" aria-hidden="true">↻</span>
-              </button>
-            </div>
-
-            @if (jobsError()) {
-              <div class="inline-error" role="alert">
-                <span>{{ jobsError() }}</span>
-                <button type="button" (click)="loadJobs()">Try again</button>
-              </div>
-            } @else if (jobsLoading() && jobs().length === 0) {
-              <div class="loading-state" role="status"><span class="spinner"></span> Loading your projects…</div>
-            } @else if (jobs().length === 0) {
-              <div class="empty-state">
-                <div class="empty-illustration" aria-hidden="true"><span>♫</span><i></i><i></i><i></i></div>
-                <h3>Your first project starts here</h3>
-                <p>Once you create a project, it’ll show up here with its current status.</p>
-                <span class="empty-hint"><span aria-hidden="true">↖</span> Enter your channel name to begin</span>
-              </div>
-            } @else {
-              <div class="job-list">
-                @for (job of jobs(); track job.id) {
-                  <article class="job-card">
-                    <div class="job-avatar" aria-hidden="true">{{ job.channelName.charAt(0).toUpperCase() }}</div>
-                    <div class="job-main">
-                      <div class="job-title-row">
-                        <h3>{{ job.channelName }}</h3>
-                        <span class="status-pill" [class.status-pending]="job.status === 'PENDING'">{{ job.status }}</span>
-                      </div>
-                      <p class="job-id" [title]="job.id">ID · {{ job.id }}</p>
-                      <p class="job-date">Created {{ job.createdAt | date:'medium' }}</p>
-                    </div>
-                    <span class="job-more" aria-hidden="true">⋯</span>
-                  </article>
+                @if (clipsError()) {
+                  <span class="stream-hint error" role="alert">{{ clipsError() }}</span>
+                  <button class="session-refresh" type="button" (click)="loadClips()">Try again</button>
+                } @else if (clipsLoading() && clips().length === 0) {
+                  <span class="stream-hint" role="status">Loading recent clips…</span>
+                } @else if (clipsLoaded() && clips().length === 0) {
+                  <span class="stream-hint">No recent clips were found for this broadcaster.</span>
+                } @else {
+                  <div class="clip-list">
+                    @for (clip of clips(); track clip.id) {
+                      <article class="clip-card">
+                        <a [href]="clip.url" target="_blank" rel="noopener noreferrer" [attr.aria-label]="'Open Twitch clip: ' + clip.title">
+                          <img [src]="clip.thumbnailUrl" [alt]="''" loading="lazy">
+                        </a>
+                        <div><a class="clip-title" [href]="clip.url" target="_blank" rel="noopener noreferrer">{{ clip.title || 'Untitled clip' }}</a>
+                          <span class="stream-hint">{{ clip.createdAt | date:'medium' }} · {{ formatClipDuration(clip.duration) }}</span>
+                          <span class="clip-association" [class.clip-verified]="clip.sessionAssociation === 'verified_target_session'">{{ clipAssociationLabel(clip.sessionAssociation) }}</span>
+                          <button class="session-refresh clip-transcribe" type="button" (click)="transcribeClip(clip.id)"
+                            [disabled]="isClipTranscribing(clip.id) || isRunningClipPipeline(clip.id)">{{ isClipTranscribing(clip.id) ? 'Transcribing…' : (clipTranscriptionError(clip.id) ? 'Try transcription again' : 'Transcribe audio') }}</button>
+                          @if (clipTranscription(clip.id)) {
+                            <button class="session-refresh clip-transcribe" type="button" (click)="transcribeClip(clip.id, true)"
+                              [disabled]="isClipTranscribing(clip.id) || isRunningClipPipeline(clip.id)">{{ isClipTranscribing(clip.id) ? 'Refreshing…' : 'Refresh transcript' }}</button>
+                          }
+                        </div>
+                        @if (clipTranscriptionError(clip.id); as transcriptionError) {
+                          <span class="stream-hint error clip-transcription-error" role="alert">{{ transcriptionError }}</span>
+                        }
+                        @if (clipTranscription(clip.id); as transcript) {
+                          <div class="clip-transcript" aria-label="Clip transcript">
+                            <p>{{ transcript.text || 'No speech was detected.' }}</p>
+                            @for (segment of transcript.segments; track $index) {
+                              <div class="clip-transcript-segment">
+                                <time>{{ formatTranscriptTime(segment.startSeconds) }}–{{ formatTranscriptTime(segment.endSeconds) }}</time>
+                                <span>{{ segment.text }}</span>
+                              </div>
+                            }
+                          </div>
+                        }
+                        <button class="session-refresh clip-moments-button" type="button" (click)="findClipMoments(clip.id)"
+                          [disabled]="isFindingClipMoments(clip.id) || isRunningClipPipeline(clip.id)">{{ isFindingClipMoments(clip.id) ? 'Finding moments…' : (clipMomentsError(clip.id) ? 'Try moments again' : 'Find memorable moments') }}</button>
+                        <button class="session-refresh clip-moments-button" type="button" (click)="runClipGenerationPipeline(clip.id)"
+                          [disabled]="!canStartClipPipeline(clip.id)">{{ isRunningClipPipeline(clip.id) ? 'Working: ' + clipPipelineStageLabel(clip.id) + '…' : (clipPipelineErrors().has(clip.id) ? 'Retry from saved results' : 'Run all · Generate spoken preview') }}</button>
+                        @if (isRunningClipPipeline(clip.id)) { <span class="stream-hint" role="status">Current step: {{ clipPipelineStageLabel(clip.id) }}.</span> }
+                        @if (clipPipelineErrors().get(clip.id); as pipelineError) { <span class="stream-hint error" role="alert">Stopped during {{ clipPipelineFailedStageLabel(clip.id) }}: {{ pipelineError }}</span> }
+                        @if (clipPipelineEmpty().has(clip.id)) { <span class="stream-hint" role="status">No memorable evidence was found. Nothing was sent for interpretation or generation.</span> }
+                        @if (clipMomentsError(clip.id); as momentsError) {
+                          <span class="stream-hint error clip-moments-error" role="alert">{{ momentsError }}</span>
+                        }
+                        @if (clipMoments(clip.id); as momentsResult) {
+                          <div class="clip-moments" aria-label="Memorable moments">
+                            <div class="moments-context">
+                              <strong>Association: {{ momentAssociationLabel(momentsResult.association) }}</strong>
+                              <span>{{ momentsResult.chatCorrelationExplanation }}</span>
+                              @if (momentsResult.chatTimingBasis) { <span>Chat time basis: EventSub delivery timestamps (coarse context that may lag speech).</span> }
+                            </div>
+                            @if (momentsResult.message) {
+                              <span class="stream-hint">{{ momentsResult.message }}</span>
+                            } @else {
+                              @for (moment of momentsResult.moments; track moment.id) {
+                                <div class="memorable-moment">
+                                  <p class="moment-description">{{ moment.description }}</p>
+                                  <span class="moment-score">Heuristic ranking · {{ moment.score }}/100</span>
+                                  <span class="moment-time">{{ formatMomentRange(moment) }}</span>
+                                  @if (moment.transcriptEvidence.length > 0) {
+                                    <div class="moment-evidence">
+                                      <strong>Transcript evidence</strong>
+                                      @for (evidence of moment.transcriptEvidence; track $index) {
+                                        <span>{{ evidence.text }}
+                                          @if (evidence.startSeconds !== null && evidence.endSeconds !== null) {
+                                            <time> · {{ formatTranscriptTime(evidence.startSeconds) }}–{{ formatTranscriptTime(evidence.endSeconds) }}</time>
+                                          } @else { <time> · Time unavailable</time> }
+                                        </span>
+                                      }
+                                    </div>
+                                  }
+                                  @for (evidence of moment.chatEvidence; track evidence.windowStartUtc) {
+                                    <div class="moment-evidence chat-moment-evidence">
+                                      <strong>Chat activity · {{ evidence.score }}/100</strong>
+                                      <span>{{ evidence.summary }}</span>
+                                      <span>UTC window {{ evidence.windowStartUtc }}–{{ evidence.windowEndUtc }} · clip-relative
+                                        @if (evidence.startSeconds !== null && evidence.endSeconds !== null) {
+                                          {{ formatTranscriptTime(evidence.startSeconds) }}–{{ formatTranscriptTime(evidence.endSeconds) }}
+                                        } @else { Time unavailable }
+                                      </span>
+                                      <span>{{ evidence.explanation }}</span>
+                                      @for (message of evidence.messages; track $index) { <q>{{ message }}</q> }
+                                    </div>
+                                  }
+                                  <span class="moment-selection">{{ moment.selectionExplanation }}</span>
+                                </div>
+                              }
+                            }
+                            @if (momentsResult.transcriptContext.suppliedCount > 0) {
+                              <section class="session-chat-context" aria-label="Selected clip transcript context">
+                                <strong>Selected clip transcript context · not a scored moment</strong>
+                                <span>{{ momentsResult.transcriptContext.sourceType === 'full_text_fallback' ? 'Transcript text fallback' : 'Analyzed ' + momentsResult.transcriptContext.analyzedCount + ' of ' + momentsResult.transcriptContext.availableCount + ' utterances' }}; supplied {{ momentsResult.transcriptContext.suppliedCount }} chunks ({{ momentsResult.transcriptContext.suppliedCharacters }} characters); omitted {{ momentsResult.transcriptContext.truncatedCount }} chunks/utterances and {{ momentsResult.transcriptContext.truncatedCharacters }} characters. Association: {{ momentAssociationLabel(momentsResult.transcriptContext.association) }}.</span>
+                                @for (utterance of momentsResult.transcriptContext.utterances; track utterance.id) {
+                                  <q>{{ utterance.startSeconds !== null && utterance.endSeconds !== null ? formatTranscriptTime(utterance.startSeconds) + '–' + formatTranscriptTime(utterance.endSeconds) + ' · ' : 'Time unavailable · ' }}{{ utterance.text }}</q>
+                                }
+                              </section>
+                            }
+                            @if (momentsResult.sessionChatContext.suppliedCount > 0) {
+                              <section class="session-chat-context" aria-label="Unaligned session chat context">
+                                <strong>Recent session chat · background only, not clip evidence</strong>
+                                <span>Analyzed {{ momentsResult.sessionChatContext.analyzedCount }} of {{ momentsResult.sessionChatContext.availableCount }} stored chat messages; supplied {{ momentsResult.sessionChatContext.suppliedCount }} text-only samples; omitted {{ momentsResult.sessionChatContext.truncatedCount }}. Samples have no clip-relative or UTC time.</span>
+                                @for (sample of momentsResult.sessionChatContext.messages; track sample.id) { <q>{{ sample.text }}</q> }
+                              </section>
+                            } @else if (momentsResult.chatCorrelation === 'unaligned' && momentsResult.association !== 'different_session') {
+                              <span class="stream-hint">No recent stored session chat is available for context. Chat collection must have been running earlier; Twitch history is not fetched.</span>
+                            }
+                            @if (canInterpretClip(clip.id)) {
+                              <button class="session-refresh clip-interpret-button" type="button" (click)="interpretClipMoments(clip.id)"
+                                [disabled]="isInterpretingClipMoments(clip.id) || isRunningClipPipeline(clip.id)">{{ isInterpretingClipMoments(clip.id) ? 'Interpreting…' : (clipInterpretationError(clip.id) ? 'Retry interpretation' : 'Interpret with AI') }}</button>
+                              @if (clipInterpretationError(clip.id); as interpretationError) {
+                                <span class="stream-hint error" role="alert">{{ interpretationError }}</span>
+                              }
+                              @if (clipInterpretation(clip.id); as interpretation) {
+                                <div class="moment-interpretations" aria-label="AI moment interpretations">
+                                  <strong>AI generated interpretation · unverified</strong>
+                                  @for (item of interpretation.moments; track item.momentId) {
+                                    <section class="moment-interpretation">
+                                      <p>{{ item.summary }}</p>
+                                      <span><b>Emotional tone:</b> {{ item.emotionalTone }}</span>
+                                      <span><b>Humor / excitement:</b> {{ item.humorExcitement }}</span>
+                                      <span><b>Narrative significance:</b> {{ item.narrativeSignificance }}</span>
+                                      <span>Source time · {{ item.startSeconds !== null && item.endSeconds !== null ? formatTranscriptTime(item.startSeconds) + '–' + formatTranscriptTime(item.endSeconds) : 'Time unavailable' }}</span>
+                                      <div class="moment-evidence"><b>Cited source evidence</b>
+                                        @for (citation of item.evidence; track citation.id) { <span>{{ citation.excerpt }} · {{ citation.kind }}</span> }
+                                      </div>
+                                    </section>
+                                  }
+                                  @if (interpretation.sessionContexts.length > 0) {
+                                    <section class="session-chat-context" aria-label="AI interpretation of session chat context">
+                                      <strong>Session chat background · not evidence from this clip</strong>
+                                      @for (context of interpretation.sessionContexts; track context.contextId) {
+                                        <div class="moment-interpretation">
+                                          <p>{{ context.summary }}</p>
+                                          <span><b>Possible tone:</b> {{ context.emotionalTone }}</span>
+                                          <span><b>Humor / excitement:</b> {{ context.humorExcitement }}</span>
+                                          <span><b>Context significance:</b> {{ context.narrativeSignificance }}</span>
+                                          <span>Association unknown · timing unavailable · not tied to a clip event</span>
+                                          @for (citation of context.evidence; track citation.id) { <q>{{ citation.excerpt }} · session chat context</q> }
+                                        </div>
+                                      }
+                                    </section>
+                                  }
+                                  @if (interpretation.transcriptContexts.length > 0) {
+                                    <section class="session-chat-context" aria-label="AI interpretation of selected clip transcript context">
+                                      <strong>Selected clip transcript context · AI interpretation, not a scored moment</strong>
+                                      @for (context of interpretation.transcriptContexts; track context.contextId) {
+                                        <div class="moment-interpretation">
+                                          <p>{{ context.summary }}</p>
+                                          <span><b>Emotional tone:</b> {{ context.emotionalTone }}</span>
+                                          <span><b>Humor / excitement:</b> {{ context.humorExcitement }}</span>
+                                          <span><b>Narrative significance:</b> {{ context.narrativeSignificance }}</span>
+                                          <span>Transcript association: {{ momentAssociationLabel(context.association) }} · context spans multiple utterances, so no single range is shown.</span>
+                                          @for (citation of context.evidence; track citation.id) { <q>{{ citation.startSeconds !== null && citation.endSeconds !== null ? formatTranscriptTime(citation.startSeconds) + '–' + formatTranscriptTime(citation.endSeconds) + ' · ' : 'Time unavailable · ' }}{{ citation.excerpt }}</q> }
+                                        </div>
+                                      }
+                                    </section>
+                                  }
+                                </div>
+                                <div class="lyrics-controls" aria-label="Lyrics style">
+                                  <label>Genre <select [ngModel]="lyricsGenre(clip.id)" (ngModelChange)="setLyricsGenre(clip.id, $event)" [disabled]="isGeneratingLyrics(clip.id) || isRunningClipPipeline(clip.id)"><option value="pop">Pop</option><option value="rock">Rock</option><option value="hip_hop">Hip hop</option><option value="electronic">Electronic</option><option value="folk">Folk</option></select></label>
+                                  <label>Mood <select [ngModel]="lyricsMood(clip.id)" (ngModelChange)="setLyricsMood(clip.id, $event)" [disabled]="isGeneratingLyrics(clip.id) || isRunningClipPipeline(clip.id)"><option value="playful">Playful</option><option value="celebratory">Celebratory</option><option value="reflective">Reflective</option><option value="dramatic">Dramatic</option></select></label>
+                                  <label>Energy <select [ngModel]="lyricsEnergy(clip.id)" (ngModelChange)="setLyricsEnergy(clip.id, $event)" [disabled]="isGeneratingLyrics(clip.id) || isRunningClipPipeline(clip.id)"><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+                                </div>
+                                <button class="session-refresh clip-interpret-button" type="button" (click)="generateClipLyrics(clip.id)" [disabled]="isGeneratingLyrics(clip.id) || isRunningClipPipeline(clip.id)">{{ isGeneratingLyrics(clip.id) ? 'Writing lyrics…' : (clipLyricsError(clip.id) ? 'Retry lyrics' : 'Generate lyrics') }}</button>
+                                @if (clipLyricsError(clip.id); as lyricsError) { <span class="stream-hint error" role="alert">{{ lyricsError }}</span> }
+                                @if (clipLyrics(clip.id); as lyrics) {
+                                  <section class="clip-lyrics" aria-label="AI generated lyrics">
+                                    <strong>AI generated lyrics · unverified</strong><span>Clip association: {{ momentAssociationLabel(lyrics.association === 'verified_target_session' ? 'verified_target_session' : lyrics.association === 'different_session' ? 'different_session' : 'unknown') }}</span><span>{{ lyrics.chatCorrelationExplanation }}</span>@if (lyrics.chatTimingBasis === 'eventsub_delivery_timestamp') { <span>Chat citations use coarse EventSub delivery times and may lag speech; they are not synchronized to audio or video.</span> }<h4>{{ lyrics.title }}</h4>
+                                    @for (section of lyrics.sections; track $index) {
+                                      <div class="lyrics-section"><b>{{ section.label }}</b>@for (line of section.lines; track $index) { <span>{{ line }}</span> }
+                                        <small>Sources: @for (source of section.sources; track source.momentId) { <span>{{ source.momentId }} · {{ source.startSeconds !== null && source.endSeconds !== null ? formatTranscriptTime(source.startSeconds) + '–' + formatTranscriptTime(source.endSeconds) : 'Time unavailable' }} · {{ momentAssociationLabel(source.association === 'verified_target_session' ? 'verified_target_session' : source.association === 'different_session' ? 'different_session' : 'unknown') }} </span> }</small>
+                                        @for (source of section.sources; track source.momentId) { @if (isSessionChatSource(source)) { <span>Session chat background · not evidence of a clip event; time unavailable.</span> } @if (isClipTranscriptContextSource(source)) { <span>Selected clip transcript context · not a scored moment.</span> } @for (evidence of source.evidence; track evidence.id) { <q>{{ evidence.startSeconds !== null && evidence.endSeconds !== null ? formatTranscriptTime(evidence.startSeconds) + '–' + formatTranscriptTime(evidence.endSeconds) + ' · ' : '' }}{{ evidence.excerpt }}</q> } }
+                                      </div>
+                                    }
+                                    <button class="session-refresh" type="button" (click)="copyClipLyrics(clip.id)" [disabled]="isCopyingLyrics(clip.id)">{{ isCopyingLyrics(clip.id) ? 'Copying…' : 'Copy lyrics' }}</button>
+                                    @if (lyricsCopyMessage(clip.id); as copyMessage) { <span role="status">{{ copyMessage }}</span> }
+                                    <button class="session-refresh" type="button" (click)="generateSpokenPreview(clip.id)" [disabled]="!canGenerateSpokenPreview(clip.id) || isRunningClipPipeline(clip.id)">{{ isGeneratingSpokenPreview(clip.id) ? 'Generating spoken preview…' : (spokenPreviewAudioUrl(clip.id) ? 'Regenerate spoken preview' : 'Generate spoken preview') }}</button>
+                                    <small>AI-generated speech reads the lyrics aloud; this is not sung music, and the spoken words may differ slightly from the text.</small>
+                                    @if (spokenPreviewError(clip.id); as spokenError) { <span class="stream-hint error" role="alert">{{ spokenError }}</span> }
+                                    @if (spokenPreviewAudioUrl(clip.id); as spokenAudio) { <audio controls preload="none" [src]="spokenAudio">Your browser does not support audio playback.</audio> }
+                                    @if (clipMusicJob(clip.id); as musicJob) {
+                                      <div class="music-job" aria-live="polite"><strong>Song generation · {{ musicJob.status }}</strong>
+                                        @if (musicJob.progressPercent !== null) { <span>{{ musicJob.progressPercent }}% complete</span> }
+                                        @if (musicJob.reason; as musicReason) { <span role="status">{{ musicJobMessage(musicReason) }}</span> }
+                                        @if (musicJob.status === 'COMPLETED' && musicJob.audioPath) { <audio controls preload="none" [src]="musicAudioUrl(musicJob)">Your browser does not support audio playback.</audio> }
+                                        @if (musicJob.status === 'FAILED' && musicJob.retryable) { <button class="session-refresh" type="button" (click)="retryMusicJob(clip.id)" [disabled]="isCreatingMusic(clip.id) || isRunningClipPipeline(clip.id)">{{ musicJob.retryMode === 'STATUS' ? 'Check provider status again' : 'Retry generation (attempt ' + (musicJob.attempt + 1) + ')' }}</button> }
+                                        @if (canResumeMusicStatus(clip.id)) { <button class="session-refresh" type="button" (click)="resumeMusicStatus(clip.id)" [disabled]="isCreatingMusic(clip.id) || isRunningClipPipeline(clip.id)">{{ isCreatingMusic(clip.id) ? 'Checking status…' : 'Resume status checks' }}</button> }
+                                      </div>
+                                    } @else {
+                                      <button class="session-refresh" type="button" (click)="createMusicJob(clip.id)" [disabled]="isCreatingMusic(clip.id) || isRunningClipPipeline(clip.id)">{{ isCreatingMusic(clip.id) ? 'Starting song…' : 'Generate song' }}</button>
+                                    }
+                                    @if (clipMusicError(clip.id); as musicError) { <span class="stream-hint error" role="alert">{{ musicError }}</span> }
+                                  </section>
+                                }
+                              }
+                            }
+                          </div>
+                        }
+                      </article>
+                    }
+                  </div>
+                  @if (clipsPage()?.nextCursor) {
+                    <button class="session-refresh" type="button" (click)="loadMoreClips()" [disabled]="clipsLoading()">{{ clipsLoading() ? 'Loading…' : 'Load more clips' }}</button>
+                  }
                 }
-              </div>
+              </section>
             }
-            <div class="jobs-footnote"><span class="footnote-dot"></span> Projects are saved for this backend session</div>
           </section>
+
         </div>
 
         <footer class="page-footer">
@@ -274,7 +376,7 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
     .brand-name span { color: var(--purple-light); }
     .header-copy { align-items: center; color: var(--muted); display: flex; font-size: .82rem; gap: 1.4rem; }
     .demo-badge { align-items: center; background: #1d1930; border: 1px solid #37304a; border-radius: 99px; color: #c3b3e4; display: inline-flex; font-size: .72rem; gap: .45rem; padding: .42rem .68rem; }
-    .demo-badge span, .footnote-dot { background: #a77aff; border-radius: 50%; height: 6px; width: 6px; }
+    .demo-badge span { background: #a77aff; border-radius: 50%; height: 6px; width: 6px; }
     .main-content { margin: 0 auto; max-width: 1200px; padding: 0 clamp(1.25rem, 5vw, 4.5rem); }
     .hero { align-items: center; display: flex; justify-content: space-between; min-height: 280px; padding: 2.2rem 1.5rem 2.2rem 0; position: relative; }
     .hero-copy { max-width: 650px; position: relative; z-index: 1; }
@@ -293,7 +395,7 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
     .art-spark { color: #bda2fb; position: absolute; text-shadow: 0 0 15px #a780fb99; }
     .spark-one { font-size: 1.25rem; right: 19px; top: 24px; }
     .spark-two { bottom: 31px; font-size: .95rem; left: 15px; }
-    .dashboard-grid { align-items: stretch; display: grid; gap: 1.1rem; grid-template-columns: minmax(310px, .88fr) minmax(0, 1.4fr); }
+    .dashboard-grid { align-items: stretch; display: grid; gap: 1.1rem; grid-template-columns: 1fr; }
     .twitch-panel { align-items: center; display: flex; flex-wrap: wrap; gap: .8rem 1.5rem; grid-column: 1 / -1; justify-content: space-between; padding: 1.1rem 1.35rem; }
     .twitch-copy h2 { color: #eee9f6; font-size: .95rem; margin: .28rem 0 .2rem; }
     .twitch-description { color: var(--muted); font-size: .72rem; margin: 0; }
@@ -317,75 +419,65 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
     .chat-summary { align-items: center; border-top: 1px solid #302b3a; display: flex; flex-basis: 100%; gap: .75rem; padding-top: .55rem; }
     .chat-count, .chat-state { color: #a9a1b7; font-size: .68rem; }
     .chat-active { color: #8cdeb2; }
+    .chat-error { color: #ffabb5; }
     .chat-messages { display: grid; flex-basis: 100%; gap: .35rem; max-height: 180px; overflow: auto; }
     .chat-message { align-items: baseline; background: #11101980; border-radius: 6px; display: flex; font-size: .7rem; gap: .5rem; min-width: 0; padding: .4rem .55rem; }
     .chat-message strong { color: #c7a9ff; flex: 0 0 auto; }
     .chat-message span { color: #d5d0df; overflow-wrap: anywhere; }
     .chat-message time { color: #817b8e; flex: 0 0 auto; font-size: .62rem; margin-left: auto; }
+    .clips-section { border-top: 1px solid #302b3a; display: grid; flex-basis: 100%; gap: .55rem; padding-top: .7rem; }
+    .clips-heading { align-items: baseline; display: flex; flex-wrap: wrap; gap: .6rem; }
+    .clips-heading h3 { color: #d9d1e7; font-size: .75rem; margin: 0; }
+    .clip-list { display: grid; gap: .45rem; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+    .clip-card { align-items: center; background: #11101980; border-radius: 7px; display: flex; gap: .6rem; min-width: 0; padding: .4rem; }
+    .clip-card img { aspect-ratio: 16 / 9; border-radius: 4px; display: block; object-fit: cover; width: 82px; }
+    .clip-card > div { display: grid; gap: .25rem; min-width: 0; }
+    .clip-title { color: #d5d0df; font-size: .7rem; overflow: hidden; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+    .clip-title:hover { color: #c7a9ff; }
+    .clip-association { color: #9c93aa; font-size: .62rem; }
+    .clip-association.clip-verified { color: #8cdeb2; }
+    .clip-card { flex-wrap: wrap; }
+    .clip-transcribe { justify-self: start; }
+    .clip-transcription-error { flex-basis: 100%; }
+    .clip-transcript { background: #0d0c1280; border-radius: 6px; display: grid; flex-basis: 100%; gap: .3rem; padding: .5rem; }
+    .clip-transcript p { color: #e2dbea; font-size: .72rem; margin: 0; overflow-wrap: anywhere; }
+    .clip-transcript-segment { align-items: baseline; display: flex; font-size: .66rem; gap: .5rem; }
+    .clip-transcript-segment time { color: #a99ebd; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+    .clip-transcript-segment span { color: #c9c2d2; overflow-wrap: anywhere; }
+    .clip-moments-button { justify-self: start; }
+    .clip-moments-error { flex-basis: 100%; }
+    .clip-moments { background: #0d0c1280; border-radius: 6px; display: grid; flex-basis: 100%; gap: .5rem; padding: .55rem; }
+    .moments-context, .moment-evidence { display: grid; gap: .2rem; }
+    .moments-context strong, .moment-evidence strong { color: #c7a9ff; font-size: .68rem; }
+    .moments-context span, .moment-evidence span, .moment-selection { color: #a9a1b7; font-size: .64rem; overflow-wrap: anywhere; }
+    .memorable-moment { border-top: 1px solid #302b3a; display: grid; gap: .3rem; padding-top: .45rem; }
+    .moment-description { color: #e2dbea; font-size: .73rem; margin: 0; overflow-wrap: anywhere; }
+    .moment-score { color: #8cdeb2; font-size: .63rem; }
+    .moment-time { color: #a99ebd; font-size: .64rem; }
+    .moment-evidence q { color: #d5d0df; font-size: .64rem; overflow-wrap: anywhere; }
+    .moment-interpretations, .session-chat-context { border-top: 1px solid #302b3a; display: grid; gap: .45rem; padding-top: .45rem; }
+    .moment-interpretations > strong, .session-chat-context > strong { color: #d8c5ff; font-size: .68rem; }
+    .moment-interpretation { display: grid; gap: .3rem; }
+    .moment-interpretation p { color: #e2dbea; font-size: .7rem; margin: 0; }
+    .moment-interpretation > span { color: #a9a1b7; font-size: .64rem; overflow-wrap: anywhere; }
+    .lyrics-controls { display:flex; gap:.5rem; flex-wrap:wrap; font-size:.68rem; }
+    .lyrics-controls label { display:grid; gap:.2rem; color:#c9c1d3; }
+    .lyrics-controls select { background:#18151e; color:#eee; border:1px solid #494253; border-radius:.35rem; padding:.3rem; }
+    .clip-lyrics { display:grid; gap:.55rem; border-top:1px solid #302b3a; padding-top:.55rem; }
+    .clip-lyrics > strong { color:#d8c5ff; font-size:.68rem; }
+    .clip-lyrics h4 { margin:0; }
+    .lyrics-section { display:grid; gap:.2rem; white-space:pre-line; }
+    .lyrics-section small { color:#a9a1b7; display:grid; }
+    .music-job { display:grid; gap:.4rem; border-top:1px solid #302b3a; padding-top:.5rem; }
+    .music-job strong { color:#d8c5ff; font-size:.72rem; }
+    .music-job audio { width:100%; }
     .session-refresh { background: transparent; border: 0; color: #b69ae8; cursor: pointer; font: inherit; font-size: .66rem; padding: .2rem; }
     .session-refresh:disabled { cursor: wait; opacity: .55; }
     .panel { background: linear-gradient(150deg, #191725, #17151f); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 12px 40px #00000014; padding: 1.5rem; }
-    .panel-heading { align-items: center; display: flex; gap: .8rem; }
-    .heading-icon { align-items: center; border-radius: 10px; display: flex; font-size: 1.05rem; height: 40px; justify-content: center; width: 40px; }
-    .create-icon { background: #34264f; color: #c5a9ff; }
-    .jobs-icon { background: #1c3340; color: #85d8e2; }
     .panel-kicker { font-size: .59rem; margin-bottom: .28rem; }
     h2 { color: var(--text); font-size: 1rem; letter-spacing: -.025em; margin: 0; }
-    .panel-description { color: var(--muted); font-size: .84rem; line-height: 1.55; margin: 1.1rem 0 1.35rem; }
     label { color: #e4e0ec; display: block; font-size: .76rem; font-weight: 650; margin-bottom: .52rem; }
-    .input-wrap { align-items: center; background: #111019; border: 1px solid #393546; border-radius: 9px; display: flex; transition: border-color .18s, box-shadow .18s; }
-    .input-wrap:focus-within { border-color: #a078f3; box-shadow: 0 0 0 3px #9d78f31c; }
-    .input-wrap.input-error { border-color: #ef6f83; }
-    .input-at { color: #978ca9; font-size: .95rem; padding-left: .85rem; }
-    input { background: transparent; border: 0; color: var(--text); flex: 1; font: inherit; font-size: .86rem; min-width: 0; outline: 0; padding: .78rem .65rem; }
-    input::placeholder { color: #696477; }
-    .field-notes { color: #827d8e; display: flex; font-size: .66rem; justify-content: space-between; margin: .45rem 0 1.12rem; }
-    .character-count { font-variant-numeric: tabular-nums; }
-    .field-error { color: #ff9ba7; font-size: .72rem; margin: -.7rem 0 .85rem; }
-    .primary-button { align-items: center; background: linear-gradient(105deg, #9266ed, #7346d3); border: 0; border-radius: 9px; box-shadow: 0 6px 18px #794fd239; color: #fff; cursor: pointer; display: flex; font: inherit; font-size: .8rem; font-weight: 700; gap: .55rem; justify-content: center; min-height: 43px; padding: .65rem .9rem; transition: filter .15s, transform .15s; width: 100%; }
-    .primary-button:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
-    .primary-button:disabled { cursor: wait; opacity: .75; }
-    .button-arrow { font-size: 1rem; margin-left: auto; }
     .spinner { animation: spin .85s linear infinite; border: 2px solid #ffffff50; border-radius: 50%; border-top-color: #fff; display: inline-block; height: 14px; width: 14px; }
-    .notice { align-items: flex-start; border-radius: 8px; display: flex; font-size: .73rem; gap: .55rem; line-height: 1.45; margin-top: .9rem; padding: .7rem .75rem; }
-    .notice-success { background: #162a25; border: 1px solid #285542; color: #9de0bf; }
-    .notice-error { background: #301b25; border: 1px solid #5a303e; color: #ffabb5; }
-    .notice-icon { align-items: center; border: 1px solid currentColor; border-radius: 50%; display: inline-flex; flex: 0 0 16px; font-size: .62rem; height: 16px; justify-content: center; margin-top: 1px; }
-    .honest-note { align-items: flex-start; color: #898495; display: flex; font-size: .68rem; gap: .45rem; line-height: 1.45; margin: 1.1rem 0 0; }
-    .honest-note span { color: #b29bdf; }
-    .jobs-panel { display: flex; flex-direction: column; min-height: 390px; }
-    .jobs-heading { align-items: center; display: flex; justify-content: space-between; }
-    .job-count { background: #2b2637; border-radius: 99px; color: #c1b5d5; display: inline-block; font-size: .62rem; font-weight: 600; margin-left: .35rem; min-width: 20px; padding: .2rem .4rem; text-align: center; vertical-align: 2px; }
-    .refresh-button { align-items: center; background: #211e2b; border: 1px solid #393445; border-radius: 8px; color: #c7bed5; cursor: pointer; display: flex; font-size: 1.2rem; height: 34px; justify-content: center; transition: background .15s; width: 34px; }
-    .refresh-button:hover:not(:disabled) { background: #302a3c; }
-    .refresh-button:disabled { cursor: wait; }
-    .spinning { animation: spin .85s linear infinite; display: inline-block; }
-    .empty-state { align-items: center; display: flex; flex: 1; flex-direction: column; justify-content: center; min-height: 250px; padding: 1rem; text-align: center; }
-    .empty-illustration { align-items: center; background: radial-gradient(circle, #312749, #201a2c); border: 1px solid #44345e; border-radius: 50%; color: #c0a2ff; display: flex; font-size: 1.35rem; gap: 3px; height: 62px; justify-content: center; margin-bottom: 1rem; position: relative; width: 62px; }
-    .empty-illustration i { background: #8a68ce; border-radius: 2px; height: 10px; width: 3px; }
-    .empty-illustration i:nth-of-type(2) { height: 17px; }
-    .empty-illustration i:nth-of-type(3) { height: 7px; }
-    .empty-state h3 { color: #e7e2ed; font-size: .87rem; margin: 0 0 .4rem; }
-    .empty-state p { color: var(--muted); font-size: .75rem; line-height: 1.5; margin: 0; max-width: 265px; }
-    .empty-hint { color: #a99bbd; font-size: .66rem; margin-top: 1rem; }
-    .empty-hint span { color: #b798f4; font-size: .85rem; }
-    .loading-state { align-items: center; color: var(--muted); display: flex; flex: 1; font-size: .8rem; gap: .65rem; justify-content: center; min-height: 210px; }
-    .inline-error { align-items: center; background: #301b25; border: 1px solid #5a303e; border-radius: 8px; color: #ffabb5; display: flex; font-size: .74rem; gap: .8rem; justify-content: space-between; margin-top: 1.5rem; padding: .75rem; }
-    .inline-error button { background: transparent; border: 0; color: #ffd7dc; cursor: pointer; font: inherit; font-weight: 700; white-space: nowrap; }
-    .job-list { display: grid; gap: .6rem; margin-top: 1.2rem; }
-    .job-card { align-items: flex-start; background: #1e1b28; border: 1px solid #302b3b; border-radius: 10px; display: flex; gap: .75rem; min-width: 0; padding: .85rem; }
-    .job-avatar { align-items: center; background: linear-gradient(145deg, #58427c, #372a4f); border: 1px solid #715d91; border-radius: 9px; color: #e6d9ff; display: flex; flex: 0 0 36px; font-size: .86rem; font-weight: 700; height: 36px; justify-content: center; }
-    .job-main { flex: 1; min-width: 0; }
-    .job-title-row { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
-    .job-title-row h3 { color: #ede8f5; font-size: .79rem; margin: 0; }
-    .status-pill { background: #272330; border: 1px solid #4b4456; border-radius: 99px; color: #c7bed2; font-size: .57rem; font-weight: 750; letter-spacing: .07em; padding: .2rem .43rem; }
-    .status-pill.status-pending { background: #302747; border-color: #5b4781; color: #d2baff; }
-    .job-id, .job-date { color: #90899c; font-size: .65rem; margin: .38rem 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .job-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .job-date { color: #777183; font-family: inherit; margin-top: .25rem; }
-    .job-more { color: #898298; font-size: 1.2rem; letter-spacing: .06em; line-height: 1; }
-    .jobs-footnote { align-items: center; border-top: 1px solid #302b3a; color: #827c8e; display: flex; font-size: .64rem; gap: .45rem; margin-top: auto; padding-top: .9rem; }
-    .footnote-dot { background: #e0b55f; height: 5px; width: 5px; }
     .page-footer { align-items: center; color: #777182; display: flex; font-size: .69rem; justify-content: space-between; padding: 1.6rem 0 2rem; }
     .footer-mark { color: #93889f; font-size: .65rem; font-weight: 800; letter-spacing: .1em; }
     .footer-mark span { color: #a77aff; }
@@ -396,7 +488,6 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
       .hero-art { margin-right: -1.4rem; opacity: .43; position: absolute; right: 0; transform: scale(.78); transform-origin: center right; }
       .hero-copy { max-width: 550px; }
       .dashboard-grid { grid-template-columns: 1fr; }
-      .jobs-panel { min-height: 330px; }
     }
     @media (max-width: 500px) {
       .topbar { align-items: flex-start; gap: .75rem; padding-bottom: .85rem; padding-top: .85rem; }
@@ -417,19 +508,13 @@ const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_]{4,25}$/;
     }
   `],
 })
-export class AppComponent implements OnInit {
-  private readonly songsApi = inject(SongsApiService);
+export class AppComponent implements OnInit, OnDestroy {
   private readonly twitchApi = inject(TwitchApiService);
   readonly twitchConnectUrl = this.twitchApi.connectUrl;
+  private readonly clipEpochs = new ClipAnalysisEpochs();
+  private clipsLoadRequest = 0;
+  private readonly manualClipRequests = new ClipRequestSubscriptions<ManualClipRequestKind>();
 
-  readonly channelName = signal('');
-  readonly channelTouched = signal(false);
-  readonly submitting = signal(false);
-  readonly jobsLoading = signal(false);
-  readonly jobs = signal<SongJob[]>([]);
-  readonly createError = signal('');
-  readonly jobsError = signal('');
-  readonly successMessage = signal('');
   readonly twitchLoading = signal(true);
   readonly twitchStatus = signal<TwitchConnectionStatus | null>(null);
   readonly twitchSession = signal<TwitchStreamSession | null>(null);
@@ -438,19 +523,56 @@ export class AppComponent implements OnInit {
   readonly chatMessages = signal<TwitchChatMessage[]>([]);
   readonly chatLoading = signal(false);
   readonly chatError = signal('');
+  readonly clips = signal<TwitchClip[]>([]);
+  readonly clipsPage = signal<TwitchClipsResponse | null>(null);
+  readonly clipsLoading = signal(false);
+  readonly clipsLoaded = signal(false);
+  readonly clipsError = signal('');
+  readonly clipTranscribing = signal<Set<string>>(new Set());
+  readonly clipTranscriptionErrors = signal<Map<string, string>>(new Map());
+  readonly clipTranscriptions = signal<Map<string, ClipTranscriptionResponse>>(new Map());
+  readonly clipMomentsLoading = signal<Set<string>>(new Set());
+  readonly clipMomentsErrors = signal<Map<string, string>>(new Map());
+  readonly clipMomentsResults = signal<Map<string, MemorableMomentsResponse>>(new Map());
+  readonly clipInterpretationLoading = signal<Set<string>>(new Set());
+  readonly clipInterpretationErrors = signal<Map<string, string>>(new Map());
+  readonly clipInterpretations = signal<Map<string, MomentInterpretationResponse>>(new Map());
+  readonly clipLyricsLoading = signal<Set<string>>(new Set());
+  readonly clipLyricsErrors = signal<Map<string, string>>(new Map());
+  readonly clipLyricsResults = signal<Map<string, ClipLyricsResponse>>(new Map());
+  readonly clipLyricsCopying = signal<Set<string>>(new Set());
+  readonly clipLyricsCopyMessages = signal<Map<string, string>>(new Map());
+  readonly spokenPreviewLoading = signal<Set<string>>(new Set());
+  readonly spokenPreviewErrors = signal<Map<string, string>>(new Map());
+  readonly spokenPreviewAudioUrls = signal<Map<string, string>>(new Map());
+  private readonly spokenPreviewRegistry = new SpokenPreviewAudioRegistry();
+  private readonly spokenPreviewSubscriptions = new Map<string, Subscription>();
+  readonly privateLyricsGenres = signal<Map<string, LyricsGenre>>(new Map());
+  readonly privateLyricsMoods = signal<Map<string, LyricsMood>>(new Map());
+  readonly privateLyricsEnergies = signal<Map<string, LyricsEnergy>>(new Map());
+  readonly clipMusicJobs = signal<Map<string, MusicJobResponse>>(new Map());
+  readonly clipMusicErrors = signal<Map<string, string>>(new Map());
+  readonly clipMusicLoading = signal<Set<string>>(new Set());
+  private readonly musicPollSubscriptions = new Map<string, Subscription>();
+  readonly clipPipelineLoading = signal<Set<string>>(new Set());
+  readonly clipPipelineStages = signal<Map<string, ClipPipelineStage>>(new Map());
+  readonly clipPipelineErrors = signal<Map<string, string>>(new Map());
+  readonly clipPipelineEmpty = signal<Set<string>>(new Set());
+  private readonly clipPipelineRequests = new Map<string, { subscription: Subscription; cancel: () => void }>();
   readonly twitchMessage = signal('');
   readonly twitchError = signal('');
-  readonly channelIsValid = computed(() => CHANNEL_NAME_PATTERN.test(this.channelName()));
-  readonly showChannelError = computed(() => this.channelTouched() && !this.channelIsValid());
-  readonly channelErrorMessage = computed(() => this.channelName().trim()
-    ? 'Use 4–25 letters, numbers, or underscores.'
-    : 'Enter a Twitch channel name.');
-
   ngOnInit(): void {
-    this.loadJobs();
     this.handleTwitchCallback();
     this.loadTwitchStatus();
     this.loadTwitchSession();
+  }
+
+  ngOnDestroy(): void {
+    this.cancelAllClipPipelines();
+    this.cancelAllManualClipRequests();
+    for (const sub of this.musicPollSubscriptions.values()) sub.unsubscribe(); this.musicPollSubscriptions.clear();
+    for (const sub of this.spokenPreviewSubscriptions.values()) sub.unsubscribe(); this.spokenPreviewSubscriptions.clear();
+    this.spokenPreviewRegistry.clearAll(); this.spokenPreviewAudioUrls.set(new Map());
   }
 
   private handleTwitchCallback(): void {
@@ -471,7 +593,11 @@ export class AppComponent implements OnInit {
     this.twitchApi.status().pipe(
       finalize(() => this.twitchLoading.set(false)),
     ).subscribe({
-      next: (status) => this.twitchStatus.set(status),
+      next: (status) => {
+        const previous = this.twitchStatus();
+        if (previous && previous.broadcasterId !== status.broadcasterId) this.clearClipAnalysisState();
+        this.twitchStatus.set(status);
+      },
       error: () => this.twitchError.set('Could not check Twitch connection. Make sure the backend is running and try again.'),
     });
   }
@@ -485,12 +611,604 @@ export class AppComponent implements OnInit {
       next: (session) => {
         this.twitchSession.set(session);
         this.loadChat();
+        if (session.connected) this.loadClips();
       },
       error: () => {
         this.twitchSession.set(null);
         this.twitchError.set('Could not load Twitch stream status. Check that the backend is running.');
       },
     });
+  }
+
+  loadClips(): void {
+    const request = ++this.clipsLoadRequest;
+    this.clipsLoading.set(true);
+    this.clipsError.set('');
+    this.clipsApiRequest().pipe(finalize(() => { if (this.clipsLoadRequest === request) this.clipsLoading.set(false); })).subscribe({
+      next: (page) => {
+        if (this.clipsLoadRequest !== request) return;
+        invalidateRemovedClipSources(this.clips().map(clip => clip.id), page.clips.map(clip => clip.id),
+          clipId => this.clearRemovedClipState(clipId));
+        this.clipsPage.set(page);
+        this.clips.set(page.clips);
+        this.clipsLoaded.set(true);
+      },
+      error: (error: unknown) => {
+        if (this.clipsLoadRequest !== request) return;
+        this.clipsLoaded.set(true);
+        this.clipsError.set(this.clipErrorMessage(error));
+      },
+    });
+  }
+
+  loadMoreClips(): void {
+    const page = this.clipsPage();
+    if (!page?.nextCursor || this.clipsLoading()) return;
+    const request = this.clipsLoadRequest;
+    this.clipsLoading.set(true);
+    this.clipsError.set('');
+    this.twitchApi.clips(20, page.nextCursor, page.startedAt, page.endedAt)
+      .pipe(finalize(() => { if (this.clipsLoadRequest === request) this.clipsLoading.set(false); })).subscribe({
+        next: (nextPage) => {
+          if (this.clipsLoadRequest !== request || this.clipsPage() !== page) return;
+          this.clipsPage.set(nextPage);
+          this.clips.set([...this.clips(), ...nextPage.clips]);
+        },
+        error: (error: unknown) => { if (this.clipsLoadRequest === request) this.clipsError.set(this.clipErrorMessage(error)); },
+      });
+  }
+
+  formatClipDuration(duration: number): string {
+    const seconds = Math.round(duration);
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  clipAssociationLabel(association: TwitchClip['sessionAssociation']): string {
+    if (association === 'verified_target_session') return 'Matched to this stream session';
+    if (association === 'different_session') return 'From a different stream';
+    return 'Session unknown · recent broadcaster clip';
+  }
+
+  isClipTranscribing(clipId: string): boolean {
+    return this.clipTranscribing().has(clipId);
+  }
+
+  isRunningClipPipeline(clipId: string): boolean { return this.clipPipelineLoading().has(clipId); }
+  canStartClipPipeline(clipId: string): boolean {
+    return canStartClipPipeline(this.isRunningClipPipeline(clipId) || this.isClipTranscribing(clipId)
+      || this.isFindingClipMoments(clipId) || this.isInterpretingClipMoments(clipId)
+      || this.isGeneratingLyrics(clipId) || this.isGeneratingSpokenPreview(clipId) || this.isCreatingMusic(clipId));
+  }
+  clipPipelineStageLabel(clipId: string): string {
+    const stage = this.clipPipelineStages().get(clipId);
+    return stage ? clipPipelineStageLabel(stage) : 'starting';
+  }
+  clipPipelineFailedStageLabel(clipId: string): string { return this.clipPipelineStageLabel(clipId); }
+
+  async runClipGenerationPipeline(clipId: string): Promise<void> {
+    if (!this.canStartClipPipeline(clipId)) return;
+    const epoch = this.currentClipEpoch(clipId);
+    this.cancelSpokenPreviewRequest(clipId);
+    this.stopMusicPolling(clipId);
+    this.clipPipelineLoading.update(p => new Set(p).add(clipId));
+    this.clipPipelineErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipPipelineEmpty.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+
+    let transcript = this.clipTranscription(clipId);
+    let moments = this.clipMoments(clipId);
+    let interpretation = this.clipInterpretation(clipId);
+    let lyrics = this.clipLyrics(clipId);
+    if (transcript && transcript.clipId !== clipId) transcript = undefined;
+    const styleMatches = (value: ClipLyricsResponse): boolean => value.genre === this.lyricsGenre(clipId)
+      && value.mood === this.lyricsMood(clipId) && value.energy === this.lyricsEnergy(clipId);
+    if (moments && moments.clipId !== clipId) moments = undefined;
+    if (interpretation && (!moments || interpretation.clipId !== clipId || interpretation.analysisId !== moments.analysisId)) interpretation = undefined;
+    if (lyrics && (!interpretation || lyrics.clipId !== clipId || lyrics.analysisId !== interpretation.analysisId
+      || lyrics.interpretationId !== interpretation.interpretationId || !styleMatches(lyrics))) lyrics = undefined;
+    if (!moments) {
+      interpretation = undefined; lyrics = undefined;
+      this.clipMomentsResults.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      this.clipInterpretations.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      this.clearLyricsResult(clipId);
+    }
+    if (!interpretation) { lyrics = undefined; this.clearLyricsResult(clipId); }
+    else if (!lyrics && this.clipLyrics(clipId)) this.clearLyricsResult(clipId);
+
+    try {
+      const result = await runClipPipeline({
+        state: { transcription: transcript, moments, interpretation, lyrics },
+        momentsHaveEvidence: value => value.moments.length > 0 || value.sessionChatContext.suppliedCount > 0 || (value.transcriptContext?.suppliedCount ?? 0) > 0,
+        isCurrent: () => this.currentClipEpoch(clipId) === epoch,
+        onStage: stage => this.clipPipelineStages.update(m => new Map(m).set(clipId, stage)),
+        run: {
+          transcription: async () => {
+            const value = await this.awaitClipPipelineRequest(clipId, this.twitchApi.transcribeClip(clipId));
+            if (value.clipId !== clipId) throw new Error('Clip transcription response did not match the selected clip.');
+            transcript = value;
+            this.clipTranscriptions.update(m => new Map(m).set(clipId, value));
+            return value;
+          },
+          moments: async () => {
+            const value = await this.awaitClipPipelineRequest(clipId, this.twitchApi.findClipMoments(clipId));
+            if (value.clipId !== clipId) throw new Error('Moment response did not match the selected clip.');
+            moments = value;
+            this.clipMomentsResults.update(m => new Map(m).set(clipId, value));
+            this.clipInterpretations.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+            this.clearLyricsResult(clipId);
+            return value;
+          },
+          interpretation: async value => {
+            const response = await this.awaitClipPipelineRequest(clipId, this.twitchApi.interpretClipMoments(clipId, value.analysisId));
+            if (response.clipId !== clipId || response.analysisId !== value.analysisId) throw new Error('Interpretation response did not match the selected clip analysis.');
+            interpretation = response;
+            this.clipInterpretations.update(m => new Map(m).set(clipId, response));
+            this.clearLyricsResult(clipId);
+            return response;
+          },
+          lyrics: async (value, interpreted) => {
+            const request: ClipLyricsRequest = { analysisId: value.analysisId, interpretationId: interpreted.interpretationId,
+              genre: this.lyricsGenre(clipId), mood: this.lyricsMood(clipId), energy: this.lyricsEnergy(clipId) };
+            const response = await this.awaitClipPipelineRequest(clipId, this.twitchApi.generateClipLyrics(clipId, request));
+            if (response.clipId !== clipId || response.analysisId !== value.analysisId || response.interpretationId !== interpreted.interpretationId
+              || response.genre !== request.genre || response.mood !== request.mood || response.energy !== request.energy) {
+              throw new Error('Lyrics response did not match the selected clip and style.');
+            }
+            lyrics = response;
+            this.clearSpokenPreview(clipId);
+            this.clearMusicState(clipId);
+            this.clipLyricsResults.update(m => new Map(m).set(clipId, response));
+            return response;
+          },
+          spokenPreview: async value => {
+            const blob = await this.awaitClipPipelineRequest(clipId, this.twitchApi.spokenLyricsPreview(clipId, value.lyricsId));
+            return blob;
+          },
+        },
+      });
+      if (this.currentClipEpoch(clipId) !== epoch) return;
+      this.clipTranscriptions.update(m => transcript ? new Map(m).set(clipId, transcript) : m);
+      this.clipMomentsResults.update(m => moments ? new Map(m).set(clipId, moments) : m);
+      this.clipInterpretations.update(m => interpretation ? new Map(m).set(clipId, interpretation) : m);
+      this.clipLyricsResults.update(m => lyrics ? new Map(m).set(clipId, lyrics) : m);
+      if (result.stoppedForNoEvidence) {
+        this.clipPipelineEmpty.update(s => new Set(s).add(clipId));
+      } else if (result.preview) {
+        const url = this.spokenPreviewRegistry.replace(clipId, result.preview);
+        this.spokenPreviewAudioUrls.update(m => new Map(m).set(clipId, url));
+        this.spokenPreviewErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      }
+    } catch (error) {
+      if (error instanceof ClipPipelineCancelled || this.currentClipEpoch(clipId) !== epoch) return;
+      const failure = error instanceof ClipPipelineFailure ? error : null;
+      const stage = failure?.stage ?? this.clipPipelineStages().get(clipId) ?? 'transcription';
+      const cause = failure?.cause ?? error;
+      this.handleClipPipelineFailure(clipId, stage, cause);
+    } finally {
+      this.clipPipelineLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    }
+  }
+
+  private handleClipPipelineFailure(clipId: string, stage: ClipPipelineStage, error: unknown): void {
+    const detail = (error as { error?: { detail?: unknown } } | null)?.error?.detail;
+    let message: string;
+    switch (stage) {
+      case 'transcription': message = clipTranscriptionErrorMessage(error); break;
+      case 'moments': message = memorableMomentsErrorMessage(error); break;
+      case 'interpretation': message = momentInterpretationErrorMessage(error); break;
+      case 'lyrics': message = clipLyricsErrorMessage(error); break;
+      case 'spoken_preview': message = spokenPreviewSafeMessage(error); break;
+    }
+    if ((stage === 'interpretation' && ['moment_analysis_expired', 'moment_analysis_stale'].includes(String(detail)))) {
+      this.clipMomentsResults.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      this.clipInterpretations.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      this.clearLyricsResult(clipId);
+      message += ' Run All again to extract fresh moments before continuing.';
+    } else if ((stage === 'lyrics' && ['interpretation_snapshot_expired', 'interpretation_snapshot_stale'].includes(String(detail)))
+      || (stage === 'spoken_preview' && detail === 'spoken_preview_lyrics_stale')) {
+      this.clipInterpretations.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+      this.clearLyricsResult(clipId);
+      message += ' Run All again to create a fresh interpretation and lyrics.';
+    }
+    this.clipPipelineErrors.update(m => new Map(m).set(clipId, message));
+  }
+
+  private awaitClipPipelineRequest<T>(clipId: string, observable: Observable<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const subscription = new Subscription();
+      const finish = (action: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (this.clipPipelineRequests.get(clipId)?.subscription === subscription) this.clipPipelineRequests.delete(clipId);
+        subscription.unsubscribe();
+        action();
+      };
+      const cancel = (): void => finish(() => reject(new ClipPipelineCancelled()));
+      this.clipPipelineRequests.set(clipId, { subscription, cancel });
+      subscription.add(observable.subscribe({
+        next: value => finish(() => resolve(value)),
+        error: error => finish(() => reject(error)),
+        complete: () => finish(() => reject(new Error('The request returned no result.'))),
+      }));
+    });
+  }
+
+  private cancelClipPipeline(clipId: string): void { this.clipPipelineRequests.get(clipId)?.cancel(); }
+  private cancelAllClipPipelines(): void { for (const request of this.clipPipelineRequests.values()) request.cancel(); this.clipPipelineRequests.clear(); }
+
+  private trackManualClipRequest<T>(clipId: string, kind: ManualClipRequestKind, epoch: number, source: Observable<T>,
+    observer: { next: (value: T) => void; error: (error: unknown) => void }, onFinish: () => void): void {
+    const request = new Subscription();
+    this.manualClipRequests.track(clipId, kind, request);
+    const child = source.pipe(finalize(() => {
+      if (this.manualClipRequests.finish(clipId, kind, request) && this.currentClipEpoch(clipId) === epoch) onFinish();
+    })).subscribe(observer);
+    request.add(child);
+  }
+
+  private cancelManualClipRequest(clipId: string, kind: ManualClipRequestKind): void {
+    this.manualClipRequests.cancel(clipId, kind, () => this.clearManualClipLoading(clipId, kind));
+  }
+
+  private cancelManualClipRequests(clipId: string): void {
+    this.manualClipRequests.cancelClip(clipId, kind => this.clearManualClipLoading(clipId, kind));
+  }
+
+  private cancelAllManualClipRequests(): void {
+    this.manualClipRequests.cancelAll((clipId, kind) => this.clearManualClipLoading(clipId, kind));
+  }
+
+  private clearManualClipLoading(clipId: string, kind: ManualClipRequestKind): void {
+    if (kind === 'transcription') this.clipTranscribing.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    if (kind === 'moments') this.clipMomentsLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    if (kind === 'interpretation') this.clipInterpretationLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    if (kind === 'lyrics') this.clipLyricsLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+  }
+
+  clipTranscriptionError(clipId: string): string | undefined {
+    return this.clipTranscriptionErrors().get(clipId);
+  }
+
+  clipTranscription(clipId: string): ClipTranscriptionResponse | undefined {
+    return this.clipTranscriptions().get(clipId);
+  }
+
+  transcribeClip(clipId: string, refresh = false): void {
+    if (this.isClipTranscribing(clipId) || this.isRunningClipPipeline(clipId)) return;
+    const epoch = this.bumpClipEpoch(clipId);
+    this.cancelSpokenPreviewRequest(clipId);
+    this.stopMusicPolling(clipId);
+    this.clipTranscribing.update((pending) => new Set(pending).add(clipId));
+    this.clipTranscriptionErrors.update((errors) => {
+      const next = new Map(errors);
+      next.delete(clipId);
+      return next;
+    });
+    this.trackManualClipRequest(clipId, 'transcription', epoch, this.twitchApi.transcribeClip(clipId, refresh), {
+      next: (response) => {
+        if (this.currentClipEpoch(clipId) !== epoch) return;
+        this.clipTranscriptions.update((transcripts) => new Map(transcripts).set(clipId, response));
+        if (refresh) this.clearClipDerivedState(clipId);
+        else this.resumeMusicPolling(clipId);
+      },
+      error: (error: unknown) => {
+        if (this.currentClipEpoch(clipId) === epoch) this.clipTranscriptionErrors.update((errors) =>
+          new Map(errors).set(clipId, clipTranscriptionErrorMessage(error)));
+        this.resumeMusicPolling(clipId);
+      },
+    }, () => this.clipTranscribing.update((pending) => { const next = new Set(pending); next.delete(clipId); return next; }));
+  }
+
+  formatTranscriptTime(seconds: number): string {
+    const safeSeconds = Math.max(0, seconds);
+    const minutes = Math.floor(safeSeconds / 60);
+    const remaining = (safeSeconds % 60).toFixed(1).padStart(4, '0');
+    return `${minutes}:${remaining}`;
+  }
+
+  isFindingClipMoments(clipId: string): boolean { return this.clipMomentsLoading().has(clipId); }
+  clipMomentsError(clipId: string): string | undefined { return this.clipMomentsErrors().get(clipId); }
+  clipMoments(clipId: string): MemorableMomentsResponse | undefined { return this.clipMomentsResults().get(clipId); }
+
+  findClipMoments(clipId: string): void {
+    if (this.isFindingClipMoments(clipId) || this.isRunningClipPipeline(clipId)) return;
+    const epoch = this.bumpClipEpoch(clipId);
+    this.cancelSpokenPreviewRequest(clipId);
+    this.stopMusicPolling(clipId);
+    this.clipMomentsLoading.update((pending) => new Set(pending).add(clipId));
+    this.clipMomentsErrors.update((errors) => {
+      const next = new Map(errors);
+      next.delete(clipId);
+      return next;
+    });
+    this.trackManualClipRequest(clipId, 'moments', epoch, this.twitchApi.findClipMoments(clipId), {
+      next: (response) => {
+        if (this.currentClipEpoch(clipId) !== epoch) return;
+        this.clipMomentsResults.update((results) => new Map(results).set(clipId, response));
+        this.clipInterpretations.update((results) => { const next = new Map(results); next.delete(clipId); return next; });
+        this.clipInterpretationErrors.update((errors) => { const next = new Map(errors); next.delete(clipId); return next; });
+        this.clearLyricsResult(clipId);
+      },
+      error: (error: unknown) => {
+        if (this.currentClipEpoch(clipId) === epoch) this.clipMomentsErrors.update((errors) =>
+          new Map(errors).set(clipId, memorableMomentsErrorMessage(error)));
+        this.resumeMusicPolling(clipId);
+      },
+    }, () => this.clipMomentsLoading.update((pending) => { const next = new Set(pending); next.delete(clipId); return next; }));
+  }
+
+  isInterpretingClipMoments(clipId: string): boolean { return this.clipInterpretationLoading().has(clipId); }
+  canInterpretClip(clipId: string): boolean {
+    const result = this.clipMoments(clipId);
+    return !!result && (result.moments.length > 0 || result.sessionChatContext.suppliedCount > 0 || (result.transcriptContext?.suppliedCount ?? 0) > 0);
+  }
+  clipInterpretationError(clipId: string): string | undefined { return this.clipInterpretationErrors().get(clipId); }
+  clipInterpretation(clipId: string): MomentInterpretationResponse | undefined { return this.clipInterpretations().get(clipId); }
+
+  interpretClipMoments(clipId: string): void {
+    const moments = this.clipMoments(clipId);
+    if (!moments || (moments.moments.length === 0 && moments.sessionChatContext.suppliedCount === 0 && (moments.transcriptContext?.suppliedCount ?? 0) === 0)
+      || this.isInterpretingClipMoments(clipId) || this.isRunningClipPipeline(clipId)) return;
+    const epoch = this.currentClipEpoch(clipId);
+    this.cancelSpokenPreviewRequest(clipId);
+    this.stopMusicPolling(clipId);
+    this.clipInterpretationLoading.update((pending) => new Set(pending).add(clipId));
+    this.clipInterpretationErrors.update((errors) => { const next = new Map(errors); next.delete(clipId); return next; });
+    this.trackManualClipRequest(clipId, 'interpretation', epoch, this.twitchApi.interpretClipMoments(clipId, moments.analysisId), {
+      next: (response) => {
+        if (this.currentClipEpoch(clipId) !== epoch || this.clipMoments(clipId)?.analysisId !== moments.analysisId) return;
+        this.clipInterpretations.update((results) => new Map(results).set(clipId, response));
+        this.clearLyricsResult(clipId);
+      },
+      error: (error: unknown) => {
+        if (this.currentClipEpoch(clipId) === epoch) this.clipInterpretationErrors.update((errors) =>
+          new Map(errors).set(clipId, momentInterpretationErrorMessage(error)));
+        this.resumeMusicPolling(clipId);
+      },
+    }, () => this.clipInterpretationLoading.update((pending) => { const next = new Set(pending); next.delete(clipId); return next; }));
+  }
+
+  lyricsGenre(clipId: string): LyricsGenre { return this.privateLyricsGenres().get(clipId) ?? 'pop'; }
+  lyricsMood(clipId: string): LyricsMood { return this.privateLyricsMoods().get(clipId) ?? 'playful'; }
+  lyricsEnergy(clipId: string): LyricsEnergy { return this.privateLyricsEnergies().get(clipId) ?? 'medium'; }
+  setLyricsGenre(clipId: string, value: LyricsGenre): void { this.privateLyricsGenres.update(m => new Map(m).set(clipId,value)); this.clearLyricsResult(clipId); }
+  setLyricsMood(clipId: string, value: LyricsMood): void { this.privateLyricsMoods.update(m => new Map(m).set(clipId,value)); this.clearLyricsResult(clipId); }
+  setLyricsEnergy(clipId: string, value: LyricsEnergy): void { this.privateLyricsEnergies.update(m => new Map(m).set(clipId,value)); this.clearLyricsResult(clipId); }
+  isGeneratingLyrics(clipId: string): boolean { return this.clipLyricsLoading().has(clipId); }
+  isCopyingLyrics(clipId: string): boolean { return this.clipLyricsCopying().has(clipId); }
+  clipLyricsError(clipId: string): string | undefined { return this.clipLyricsErrors().get(clipId); }
+  clipLyrics(clipId: string): ClipLyricsResponse | undefined { return this.clipLyricsResults().get(clipId); }
+  lyricsCopyMessage(clipId: string): string | undefined { return this.clipLyricsCopyMessages().get(clipId); }
+
+  isGeneratingSpokenPreview(clipId: string): boolean { return this.spokenPreviewLoading().has(clipId); }
+  canGenerateSpokenPreview(clipId: string): boolean {
+    return canGenerateSpokenPreview(this.clipLyrics(clipId), this.isGeneratingSpokenPreview(clipId));
+  }
+  spokenPreviewError(clipId: string): string | undefined { return this.spokenPreviewErrors().get(clipId); }
+  spokenPreviewAudioUrl(clipId: string): string | undefined { return this.spokenPreviewAudioUrls().get(clipId); }
+
+  generateSpokenPreview(clipId: string): void {
+    if (this.isRunningClipPipeline(clipId)) return;
+    const lyrics=this.clipLyrics(clipId);if(!canGenerateSpokenPreview(lyrics,this.isGeneratingSpokenPreview(clipId))||!lyrics)return;
+    const epoch=this.currentClipEpoch(clipId),lyricsId=lyrics.lyricsId;
+    this.spokenPreviewLoading.update(p=>new Set(p).add(clipId));
+    this.spokenPreviewErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    let sub:Subscription;
+    sub=this.twitchApi.spokenLyricsPreview(clipId,lyricsId).pipe(finalize(()=>{
+      this.spokenPreviewLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;});
+      if(this.spokenPreviewSubscriptions.get(clipId)===sub)this.spokenPreviewSubscriptions.delete(clipId);
+    })).subscribe({
+      next:blob=>{
+        if(!isCurrentSpokenPreview(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))return;
+        const url=this.spokenPreviewRegistry.replace(clipId,blob);
+        this.spokenPreviewAudioUrls.update(m=>new Map(m).set(clipId,url));
+      },
+      error:error=>{
+        if(isCurrentSpokenPreview(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))
+          this.spokenPreviewErrors.update(m=>new Map(m).set(clipId,spokenPreviewSafeMessage(error)));
+      },
+    });
+    this.spokenPreviewSubscriptions.set(clipId,sub);
+  }
+
+  private clearSpokenPreview(clipId:string):void {
+    this.cancelSpokenPreviewRequest(clipId);
+    this.spokenPreviewRegistry.clear(clipId);
+    this.spokenPreviewAudioUrls.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.spokenPreviewErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.spokenPreviewLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;});
+  }
+
+  private cancelSpokenPreviewRequest(clipId:string):void {
+    this.spokenPreviewSubscriptions.get(clipId)?.unsubscribe();this.spokenPreviewSubscriptions.delete(clipId);
+  }
+
+  generateClipLyrics(clipId: string): void {
+    const interpretation = this.clipInterpretation(clipId);
+    if (!interpretation || this.isGeneratingLyrics(clipId) || this.isRunningClipPipeline(clipId)) return;
+    const epoch = this.currentClipEpoch(clipId);
+    this.cancelSpokenPreviewRequest(clipId);
+    this.stopMusicPolling(clipId);
+    const request: ClipLyricsRequest = { analysisId: interpretation.analysisId, interpretationId: interpretation.interpretationId,
+      genre: this.lyricsGenre(clipId), mood: this.lyricsMood(clipId), energy: this.lyricsEnergy(clipId) };
+    this.clipLyricsLoading.update(p => new Set(p).add(clipId));
+    this.clipLyricsErrors.update(e => { const n=new Map(e); n.delete(clipId); return n; });
+    this.trackManualClipRequest(clipId, 'lyrics', epoch, this.twitchApi.generateClipLyrics(clipId,request), {
+      next: result => { if(!isCurrentLyricsRequest(this.currentClipEpoch(clipId),epoch,this.clipInterpretation(clipId)?.interpretationId,request.interpretationId)) return; this.clearSpokenPreview(clipId); this.clearMusicState(clipId); this.clipLyricsResults.update(r=>new Map(r).set(clipId,result)); },
+      error: error => { if(isCurrentLyricsRequest(this.currentClipEpoch(clipId),epoch,this.clipInterpretation(clipId)?.interpretationId,request.interpretationId)) this.clipLyricsErrors.update(e=>new Map(e).set(clipId,clipLyricsErrorMessage(error))); this.resumeMusicPolling(clipId); },
+    }, () => this.clipLyricsLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;}));
+  }
+
+  clipMusicJob(clipId: string): MusicJobResponse | undefined { return this.clipMusicJobs().get(clipId); }
+  clipMusicError(clipId: string): string | undefined { return this.clipMusicErrors().get(clipId); }
+  isCreatingMusic(clipId: string): boolean { return this.clipMusicLoading().has(clipId); }
+  canResumeMusicStatus(clipId: string): boolean {
+    return canResumeMusicStatus(this.clipMusicJob(clipId), !!this.clipMusicError(clipId),
+      this.musicPollSubscriptions.has(clipId), this.isCreatingMusic(clipId));
+  }
+  musicAudioUrl(job: MusicJobResponse): string { return this.twitchApi.musicAudioUrl(job.jobId); }
+  musicJobMessage(reason: string): string { return musicJobSafeMessage(reason); }
+
+  createMusicJob(clipId: string): void {
+    const lyrics=this.clipLyrics(clipId); if(!lyrics||this.isCreatingMusic(clipId)||this.clipMusicJob(clipId)||this.isRunningClipPipeline(clipId))return;
+    const epoch=this.currentClipEpoch(clipId), lyricsId=lyrics.lyricsId;
+    this.clipMusicLoading.update(p=>new Set(p).add(clipId));this.clipMusicErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.twitchApi.createMusicJob(clipId,lyricsId).pipe(finalize(()=>this.clipMusicLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;}))).subscribe({
+      next:job=>{if(!isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))return;this.setMusicJob(clipId,job,epoch,lyricsId);},
+      error:error=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.clipMusicErrors.update(m=>new Map(m).set(clipId,musicCreateSafeMessage(error)));},
+    });
+  }
+
+  retryMusicJob(clipId: string): void {
+    const current=this.clipMusicJob(clipId);if(!current||!current.retryable||this.isCreatingMusic(clipId))return;
+    const epoch=this.currentClipEpoch(clipId),lyricsId=this.clipLyrics(clipId)?.lyricsId;if(!lyricsId)return;
+    this.clipMusicLoading.update(p=>new Set(p).add(clipId));
+    this.twitchApi.retryMusicJob(current.jobId,current.attempt).pipe(finalize(()=>this.clipMusicLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;}))).subscribe({
+      next:job=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.setMusicJob(clipId,job,epoch,lyricsId);},
+      error:error=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId)){this.clipMusicErrors.update(m=>new Map(m).set(clipId,musicCreateSafeMessage(error)));this.twitchApi.musicJob(current.jobId).subscribe({next:job=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.setMusicJob(clipId,job,epoch,lyricsId);},error:()=>{}});}},
+    });
+  }
+
+  resumeMusicStatus(clipId: string): void {
+    const current=this.clipMusicJob(clipId);if(!this.canResumeMusicStatus(clipId)||!current)return;
+    const epoch=this.currentClipEpoch(clipId),lyricsId=this.clipLyrics(clipId)?.lyricsId;if(!lyricsId)return;
+    this.clipMusicLoading.update(p=>new Set(p).add(clipId));this.clipMusicErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.twitchApi.musicJob(current.jobId).pipe(finalize(()=>this.clipMusicLoading.update(p=>{const n=new Set(p);n.delete(clipId);return n;}))).subscribe({
+      next:job=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.setMusicJob(clipId,job,epoch,lyricsId);},
+      error:()=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.clipMusicErrors.update(m=>new Map(m).set(clipId,'Could not check song status. Try again later.'));},
+    });
+  }
+
+  private setMusicJob(clipId:string,job:MusicJobResponse,epoch:number,lyricsId:string):void {
+    this.clipMusicJobs.update(m=>new Map(m).set(clipId,job));
+    if(isTerminalMusicJob(job.status)){this.stopMusicPolling(clipId);return;}
+    this.stopMusicPolling(clipId);
+    let sub: Subscription;
+    sub=pollMusicJob(job.jobId,id=>this.twitchApi.musicJob(id)).pipe(
+      finalize(()=>{if(this.musicPollSubscriptions.get(clipId)===sub)this.musicPollSubscriptions.delete(clipId);})).subscribe({next:value=>{
+        if(!isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId)){this.stopMusicPolling(clipId);return;}
+        this.clipMusicJobs.update(m=>new Map(m).set(clipId,value));
+      },error:()=>{if(isCurrentMusicJobRequest(this.currentClipEpoch(clipId),epoch,this.clipLyrics(clipId)?.lyricsId,lyricsId))this.clipMusicErrors.update(m=>new Map(m).set(clipId,'Could not check song status. Try again later.'));}});
+    this.musicPollSubscriptions.set(clipId,sub);
+  }
+
+  private stopMusicPolling(clipId:string):void { this.musicPollSubscriptions.get(clipId)?.unsubscribe();this.musicPollSubscriptions.delete(clipId); }
+  private resumeMusicPolling(clipId:string):void {
+    const job=this.clipMusicJob(clipId),lyricsId=this.clipLyrics(clipId)?.lyricsId;
+    if(job&&!isTerminalMusicJob(job.status)&&lyricsId)this.setMusicJob(clipId,job,this.currentClipEpoch(clipId),lyricsId);
+  }
+  private clearMusicState(clipId:string):void {
+    this.stopMusicPolling(clipId);this.clipMusicJobs.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.clipMusicErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+  }
+
+  async copyClipLyrics(clipId: string): Promise<void> {
+    const lyrics=this.clipLyrics(clipId); if(!lyrics || this.isCopyingLyrics(clipId)) return;
+    const epoch=this.currentClipEpoch(clipId);
+    this.clipLyricsCopying.update(p=>new Set(p).add(clipId));
+    try { await navigator.clipboard.writeText(formatClipLyricsForCopy(lyrics));
+      if(this.currentClipEpoch(clipId)===epoch && this.clipLyrics(clipId)===lyrics) this.clipLyricsCopyMessages.update(m=>new Map(m).set(clipId,'Lyrics copied.'));
+    } catch { if(this.currentClipEpoch(clipId)===epoch && this.clipLyrics(clipId)===lyrics) this.clipLyricsCopyMessages.update(m=>new Map(m).set(clipId,'Could not copy lyrics. Check clipboard permissions.')); }
+    finally { this.clipLyricsCopying.update(p=>{const n=new Set(p);n.delete(clipId);return n;}); }
+  }
+
+  private clearLyricsResult(clipId: string): void {
+    this.clearSpokenPreview(clipId);
+    this.clearMusicState(clipId);
+    this.clipLyricsResults.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.clipLyricsErrors.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+    this.clipLyricsCopyMessages.update(m=>{const n=new Map(m);n.delete(clipId);return n;});
+  }
+
+  private currentClipEpoch(clipId: string): number { return this.clipEpochs.current(clipId); }
+  private bumpClipEpoch(clipId: string): number {
+    this.cancelClipPipeline(clipId);
+    this.cancelManualClipRequests(clipId);
+    return this.clipEpochs.next(clipId);
+  }
+  private clearRemovedClipState(clipId: string): void {
+    this.bumpClipEpoch(clipId);
+    this.stopMusicPolling(clipId);
+    this.clearSpokenPreview(clipId);
+    this.clipTranscriptions.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipTranscriptionErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipMomentsResults.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipMomentsErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipInterpretations.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipInterpretationErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipTranscribing.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipMomentsLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipInterpretationLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipLyricsLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipLyricsCopying.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipMusicLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clearLyricsResult(clipId);
+    this.clipPipelineLoading.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+    this.clipPipelineStages.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipPipelineErrors.update(m => { const n = new Map(m); n.delete(clipId); return n; });
+    this.clipPipelineEmpty.update(s => { const n = new Set(s); n.delete(clipId); return n; });
+  }
+  private clearClipDerivedState(clipId: string): void {
+    this.clipMomentsResults.update((values) => { const next = new Map(values); next.delete(clipId); return next; });
+    this.clipInterpretations.update((values) => { const next = new Map(values); next.delete(clipId); return next; });
+    this.clipMomentsErrors.update((values) => { const next = new Map(values); next.delete(clipId); return next; });
+    this.clipInterpretationErrors.update((values) => { const next = new Map(values); next.delete(clipId); return next; });
+    this.clearLyricsResult(clipId);
+  }
+  private clearClipAnalysisState(): void {
+    this.cancelAllClipPipelines();
+    this.cancelAllManualClipRequests();
+    this.clipEpochs.invalidateAll();
+    this.clipTranscriptions.set(new Map());
+    this.clipTranscriptionErrors.set(new Map());
+    this.clipMomentsResults.set(new Map());
+    this.clipMomentsErrors.set(new Map());
+    this.clipInterpretations.set(new Map());
+    this.clipInterpretationErrors.set(new Map());
+    this.clipTranscribing.set(new Set());
+    this.clipMomentsLoading.set(new Set());
+    this.clipInterpretationLoading.set(new Set());
+    this.clipLyricsResults.set(new Map()); this.clipLyricsErrors.set(new Map()); this.clipLyricsLoading.set(new Set());
+    this.clipLyricsCopyMessages.set(new Map()); this.clipLyricsCopying.set(new Set());
+    this.privateLyricsGenres.set(new Map()); this.privateLyricsMoods.set(new Map()); this.privateLyricsEnergies.set(new Map());
+    for(const sub of this.musicPollSubscriptions.values())sub.unsubscribe();this.musicPollSubscriptions.clear();
+    for(const sub of this.spokenPreviewSubscriptions.values())sub.unsubscribe();this.spokenPreviewSubscriptions.clear();
+    this.spokenPreviewRegistry.clearAll();this.spokenPreviewAudioUrls.set(new Map());this.spokenPreviewErrors.set(new Map());this.spokenPreviewLoading.set(new Set());
+    this.clipMusicJobs.set(new Map());this.clipMusicErrors.set(new Map());this.clipMusicLoading.set(new Set());
+    this.clipPipelineLoading.set(new Set()); this.clipPipelineStages.set(new Map());
+    this.clipPipelineErrors.set(new Map()); this.clipPipelineEmpty.set(new Set());
+  }
+
+  formatMomentRange(moment: MemorableMoment): string {
+    return moment.startSeconds !== null && moment.endSeconds !== null
+      ? `${this.formatTranscriptTime(moment.startSeconds)}–${this.formatTranscriptTime(moment.endSeconds)}`
+      : 'Time unavailable';
+  }
+
+  momentAssociationLabel(association: MemorableMomentsResponse['association']): string {
+    if (association === 'verified_target_session') return 'verified target stream';
+    if (association === 'different_session') return 'different stream';
+    return 'unknown';
+  }
+
+  isSessionChatSource(source: ClipLyricsResponse['sections'][number]['sources'][number]): boolean {
+    return source.evidence.some(evidence => evidence.kind === 'session_chat_context');
+  }
+
+  isClipTranscriptContextSource(source: ClipLyricsResponse['sections'][number]['sources'][number]): boolean {
+    return source.evidence.some(evidence => evidence.kind === 'clip_transcript_context');
+  }
+
+  private clipsApiRequest() { return this.twitchApi.clips(); }
+
+  private clipErrorMessage(error: unknown): string {
+    if (error instanceof HttpErrorResponse) {
+      if (error.status === 409) return 'Connect a Twitch account to discover clips.';
+      if (error.status === 429) return 'Twitch is rate limiting clip requests. Try again shortly.';
+      if (error.status === 502) return 'Twitch could not complete the clip request. Check app credentials and try again.';
+      if (error.status === 503 || error.status === 0) return 'Clip discovery is unavailable. Check the backend configuration and try again.';
+    }
+    return 'Could not load Twitch clips. Please try again.';
   }
 
   private loadChat(): void {
@@ -514,11 +1232,22 @@ export class AppComponent implements OnInit {
       awaiting_stream: 'Waiting for a live stream',
       stopped: 'Collection stopped',
       authorization_required: 'Chat authorization required — reconnect Twitch',
+      unauthorized: 'Twitch rejected the app token',
       not_configured: 'Chat webhook not configured',
+      conflict_unresolved: 'Existing chat subscription needs review',
       failed: 'Chat subscription failed',
       disconnected: 'Twitch disconnected',
     };
     return status ? labels[status] ?? status : 'Checking chat status';
+  }
+
+  chatStatusIsError(status: string | undefined): boolean {
+    return Boolean(status && (status.startsWith('revoked:')
+      || ['failed', 'unauthorized', 'authorization_required', 'conflict_unresolved'].includes(status)));
+  }
+
+  streamEventSubDisplay() {
+    return streamSubscriptionDisplay(this.twitchSession()?.subscriptionStatuses);
   }
 
   private twitchCallbackError(reason: string | null): string {
@@ -536,55 +1265,4 @@ export class AppComponent implements OnInit {
       : 'Twitch sign-in could not be completed. Please try again.';
   }
 
-  onChannelNameChange(value: string): void {
-    this.channelName.set(value);
-    this.createError.set('');
-    this.successMessage.set('');
-  }
-
-  createSong(): void {
-    this.channelTouched.set(true);
-    if (!this.channelIsValid() || this.submitting()) return;
-
-    this.submitting.set(true);
-    this.createError.set('');
-    this.successMessage.set('');
-
-    this.songsApi.create({ channelName: this.channelName() }).pipe(
-      finalize(() => this.submitting.set(false)),
-    ).subscribe({
-      next: (job) => {
-        this.successMessage.set(`Project created for ${job.channelName}. Its current status is ${job.status}.`);
-        this.channelName.set('');
-        this.channelTouched.set(false);
-        this.loadJobs();
-      },
-      error: (error: unknown) => {
-        this.createError.set(this.errorMessage(error, 'Could not create the song project. Please try again.'));
-      },
-    });
-  }
-
-  loadJobs(): void {
-    this.jobsLoading.set(true);
-    this.jobsError.set('');
-    this.songsApi.list().pipe(
-      finalize(() => this.jobsLoading.set(false)),
-    ).subscribe({
-      next: (jobs) => this.jobs.set(jobs),
-      error: (error: unknown) => {
-        this.jobsError.set(this.errorMessage(error, 'Could not load song projects. Check that the backend is running.'));
-      },
-    });
-  }
-
-  private errorMessage(error: unknown, fallback: string): string {
-    if (error instanceof HttpErrorResponse) {
-      const detail = error.error?.detail;
-      if (typeof detail === 'string' && detail.trim()) return detail;
-      if (error.status === 0) return 'Can’t reach the backend. Make sure Spring Boot is running on port 8080.';
-      if (error.status >= 500) return 'The backend had a problem. Please try again in a moment.';
-    }
-    return fallback;
-  }
 }

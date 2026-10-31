@@ -8,6 +8,7 @@ import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -31,13 +32,14 @@ public class TwitchOAuthService implements TwitchBroadcasterProvider {
     private static final URI TOKEN_URI = URI.create("https://id.twitch.tv/oauth2/token");
     private static final URI VALIDATE_URI = URI.create("https://id.twitch.tv/oauth2/validate");
     private static final Duration STATE_LIFETIME = Duration.ofMinutes(10);
-    private static final String CHAT_SCOPES = "user:read:chat user:bot channel:bot";
+    private static final String REQUIRED_SCOPES = "user:read:chat user:bot channel:bot channel:manage:clips";
 
     private final TwitchOAuthProperties properties;
     private final RestTemplate restTemplate;
     private final SecureRandom secureRandom = new SecureRandom();
     private final Map<String, PendingOAuthState> pendingStates = new ConcurrentHashMap<>();
     private final AtomicReference<ConnectedAccount> connectedAccount = new AtomicReference<>();
+    private final AtomicLong connectionGenerations = new AtomicLong();
 
     public TwitchOAuthService(TwitchOAuthProperties properties, RestTemplate twitchRestTemplate) {
         this.properties = properties;
@@ -58,7 +60,7 @@ public class TwitchOAuthService implements TwitchBroadcasterProvider {
                 .queryParam("client_id", properties.clientId())
                 .queryParam("redirect_uri", properties.redirectUri())
                 .queryParam("response_type", "code")
-                .queryParam("scope", CHAT_SCOPES)
+                .queryParam("scope", REQUIRED_SCOPES)
                 .queryParam("state", state)
                 .build()
                 .encode()
@@ -87,8 +89,8 @@ public class TwitchOAuthService implements TwitchBroadcasterProvider {
                 java.util.List.of("user:read:chat", "user:bot", "channel:bot"))) {
             throw new TwitchOAuthFailure("chat_scopes_missing");
         }
-
-        connectedAccount.set(new ConnectedAccount(identity.userId(), identity.login(), token.accessToken()));
+        connectedAccount.set(new ConnectedAccount(identity.userId(), identity.login(), token.accessToken(),
+                identity.scopes().contains("channel:manage:clips"), connectionGenerations.incrementAndGet()));
     }
 
     public TwitchConnectionStatusResponse connectionStatus() {
@@ -103,6 +105,37 @@ public class TwitchOAuthService implements TwitchBroadcasterProvider {
     public String connectedBroadcasterId() {
         ConnectedAccount account = connectedAccount.get();
         return account == null ? null : account.broadcasterId();
+    }
+
+    @Override
+    public ConnectionScope connectionScope() {
+        ConnectedAccount account = connectedAccount.get();
+        return account == null ? null : new ConnectionScope(account.broadcasterId(), account.generation());
+    }
+
+    public ClipAuthorizationContext clipAuthorizationContext(ConnectionScope expectedScope) {
+        ConnectedAccount account = connectedAccount.get();
+        if (account == null || expectedScope == null || !account.broadcasterId().equals(expectedScope.broadcasterId())
+                || account.generation() != expectedScope.generation()) return null;
+        return new ClipAuthorizationContext(expectedScope, account.accessToken(), account.clipDownloadScope());
+    }
+
+    public boolean isCurrentConnection(ConnectionScope expectedScope) {
+        return expectedScope != null && expectedScope.equals(connectionScope());
+    }
+
+    public record ClipAuthorizationContext(ConnectionScope scope, String accessToken, boolean clipDownloadScope) {
+        @Override public String toString() { return "ClipAuthorizationContext[scope=" + scope + ", accessToken=redacted]"; }
+    }
+
+    public String connectedUserAccessToken() {
+        ConnectedAccount account = connectedAccount.get();
+        return account == null ? null : account.accessToken();
+    }
+
+    public boolean hasClipDownloadScope() {
+        ConnectedAccount account = connectedAccount.get();
+        return account != null && account.clipDownloadScope();
     }
 
     public URI frontendRedirect(String outcome, String reason) {
@@ -188,14 +221,22 @@ public class TwitchOAuthService implements TwitchBroadcasterProvider {
         private final String login;
         @SuppressWarnings("unused")
         private final String accessToken;
+        private final boolean clipDownloadScope;
+        private final long generation;
 
-        private ConnectedAccount(String broadcasterId, String login, String accessToken) {
+        private ConnectedAccount(String broadcasterId, String login, String accessToken, boolean clipDownloadScope,
+                long generation) {
             this.broadcasterId = broadcasterId;
             this.login = login;
             this.accessToken = accessToken;
+            this.clipDownloadScope = clipDownloadScope;
+            this.generation = generation;
         }
 
         private String broadcasterId() { return broadcasterId; }
         private String login() { return login; }
+        private String accessToken() { return accessToken; }
+        private boolean clipDownloadScope() { return clipDownloadScope; }
+        private long generation() { return generation; }
     }
 }

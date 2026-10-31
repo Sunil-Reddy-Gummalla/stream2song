@@ -13,4 +13,8 @@ public class TwitchEventSubWebhookException extends RuntimeException {
     public HttpStatus status() {
         return status;
     }
+
+    public String reason() {
+        return getMessage();
+    }
 }

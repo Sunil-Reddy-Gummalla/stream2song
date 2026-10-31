@@ -38,9 +38,11 @@ class TwitchEventSubWebhookControllerTest {
         TwitchStreamSessionService sessions = new TwitchStreamSessionService();
         TwitchEventSubSubscriptionRegistry registry = new TwitchEventSubSubscriptionRegistry();
         org.springframework.web.client.RestTemplate restTemplate = new org.springframework.web.client.RestTemplate();
+        com.stream2song.backend.config.TwitchOAuthProperties oauthProperties =
+                new com.stream2song.backend.config.TwitchOAuthProperties("", "", "", "");
         TwitchEventSubSubscriptionService subscriptions = new TwitchEventSubSubscriptionService(
-                new com.stream2song.backend.config.TwitchOAuthProperties("", "", "", ""),
-                new TwitchEventSubProperties("", ""), registry, restTemplate);
+                oauthProperties, new TwitchEventSubProperties("", ""), registry,
+                new com.stream2song.backend.service.TwitchAppAccessTokenService(oauthProperties, restTemplate), restTemplate);
         TwitchBroadcasterProvider provider = () -> "broadcaster-42";
         TwitchEventSubWebhookService service = new TwitchEventSubWebhookService(
                 new TwitchEventSubProperties("https://stream2song.example/api/twitch/eventsub/webhook", SECRET),

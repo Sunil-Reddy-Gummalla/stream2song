@@ -1,7 +1,9 @@
 package com.stream2song.backend.service;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.PriorityQueue;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -13,6 +15,10 @@ import com.stream2song.backend.model.TwitchChatMessage;
 
 @Service
 public class TwitchChatMessageService {
+    private static final int MAX_LATEST_LIMIT = 500;
+    private static final Comparator<TwitchChatMessage> CHRONOLOGICAL = Comparator
+            .comparing(TwitchChatMessage::timestamp, Comparator.nullsFirst(Comparator.naturalOrder()))
+            .thenComparing(TwitchChatMessage::messageId, Comparator.nullsFirst(Comparator.naturalOrder()));
     private final Map<String, TwitchChatMessage> messagesById = new ConcurrentHashMap<>();
 
     public enum RecordResult { STORED, DUPLICATE, INVALID }
@@ -33,12 +39,32 @@ public class TwitchChatMessageService {
     }
 
     public List<TwitchChatMessage> latest(String broadcasterId, String streamId, int limit) {
+        if (broadcasterId == null || streamId == null || limit <= 0) return List.of();
+        int boundedLimit = Math.min(limit, MAX_LATEST_LIMIT);
+        PriorityQueue<TwitchChatMessage> newest = new PriorityQueue<>(boundedLimit, CHRONOLOGICAL);
+        for (TwitchChatMessage message : messagesById.values()) {
+            if (!broadcasterId.equals(message.broadcasterId()) || !streamId.equals(message.streamId())) continue;
+            if (newest.size() < boundedLimit) {
+                newest.add(message);
+            } else if (CHRONOLOGICAL.compare(message, newest.peek()) > 0) {
+                newest.poll();
+                newest.add(message);
+            }
+        }
+        List<TwitchChatMessage> result = new ArrayList<>(newest);
+        result.sort(CHRONOLOGICAL);
+        return List.copyOf(result);
+    }
+
+    public List<TwitchChatMessage> allForStream(String broadcasterId, String streamId) {
         if (broadcasterId == null || streamId == null) return List.of();
         return messagesById.values().stream()
-                .filter(message -> broadcasterId.equals(message.broadcasterId()) && streamId.equals(message.streamId()))
-                .sorted(Comparator.comparing(TwitchChatMessage::timestamp).reversed())
-                .limit(limit)
-                .sorted(Comparator.comparing(TwitchChatMessage::timestamp))
+                .filter(message -> broadcasterId.equals(message.broadcasterId())
+                        && streamId.equals(message.streamId()))
+                .sorted(Comparator.comparing(TwitchChatMessage::timestamp,
+                                Comparator.nullsLast(Comparator.naturalOrder()))
+                        .thenComparing(TwitchChatMessage::messageId,
+                                Comparator.nullsLast(Comparator.naturalOrder())))
                 .toList();
     }
 

@@ -49,12 +49,12 @@ class TwitchOAuthServiceTest {
                 .andExpect(method(HttpMethod.GET))
                 .andExpect(header("Authorization", "OAuth test-access-token"))
                 .andRespond(withSuccess("""
-                        {"client_id":"test-client-id","user_id":"12345","login":"streamer_one","scopes":["user:read:chat","user:bot","channel:bot"],"expires_in":3600}
+                        {"client_id":"test-client-id","user_id":"12345","login":"streamer_one","scopes":["user:read:chat","user:bot","channel:bot","channel:manage:clips"],"expires_in":3600}
                         """, MediaType.APPLICATION_JSON));
 
         String state = stateFrom(service.createAuthorizationUri(SESSION_ID));
         assertThat(UriComponentsBuilder.fromUri(service.createAuthorizationUri(SESSION_ID)).build()
-                .getQueryParams().getFirst("scope")).isEqualTo("user:read:chat%20user:bot%20channel:bot");
+                .getQueryParams().getFirst("scope")).isEqualTo("user:read:chat%20user:bot%20channel:bot%20channel:manage:clips");
         service.completeAuthorization(state, "one-time-code", null, SESSION_ID);
 
         TwitchConnectionStatusResponse status = service.connectionStatus();
@@ -77,6 +77,50 @@ class TwitchOAuthServiceTest {
         assertThatThrownBy(() -> service.completeAuthorization(state, "one-time-code", null, SESSION_ID))
                 .isInstanceOf(TwitchOAuthFailure.class).hasMessage("chat_scopes_missing");
         assertThat(service.connectionStatus().connected()).isFalse();
+        twitchServer.verify();
+    }
+
+    @Test
+    void preservesChatConnectionWhenValidatedTokenLacksOptionalClipDownloadScope() {
+        expectTokenExchange();
+        twitchServer.expect(requestTo("https://id.twitch.tv/oauth2/validate"))
+                .andRespond(withSuccess("""
+                        {"client_id":"test-client-id","user_id":"12345","login":"streamer_one","scopes":["user:read:chat","user:bot","channel:bot"],"expires_in":3600}
+                        """, MediaType.APPLICATION_JSON));
+        String state = stateFrom(service.createAuthorizationUri(SESSION_ID));
+        service.completeAuthorization(state, "one-time-code", null, SESSION_ID);
+        assertThat(service.connectionStatus().connected()).isTrue();
+        assertThat(service.hasClipDownloadScope()).isFalse();
+        twitchServer.verify();
+    }
+
+    @Test
+    void reconnectingTheSameBroadcasterCreatesANewConnectionGeneration() {
+        String stateA1 = service.createAuthorizationUri(SESSION_ID).toString();
+        String stateB = service.createAuthorizationUri(SESSION_ID).toString();
+        String stateA2 = service.createAuthorizationUri(SESSION_ID).toString();
+        String[] states = {stateA1, stateB, stateA2};
+        String[][] owners = {{"owner-a", "streamer_a"}, {"owner-b", "streamer_b"}, {"owner-a", "streamer_a"}};
+        for (String[] owner : owners) {
+            expectTokenExchange();
+            twitchServer.expect(requestTo("https://id.twitch.tv/oauth2/validate"))
+                    .andRespond(withSuccess("""
+                            {"client_id":"test-client-id","user_id":"%s","login":"%s","scopes":["user:read:chat","user:bot","channel:bot","channel:manage:clips"],"expires_in":3600}
+                            """.formatted(owner[0], owner[1]), MediaType.APPLICATION_JSON));
+        }
+        service.completeAuthorization(stateFrom(URI.create(stateA1)), "one-time-code", null, SESSION_ID);
+        var first = service.connectionScope();
+        service.completeAuthorization(stateFrom(URI.create(stateB)), "one-time-code", null, SESSION_ID);
+        var second = service.connectionScope();
+        service.completeAuthorization(stateFrom(URI.create(stateA2)), "one-time-code", null, SESSION_ID);
+        var third = service.connectionScope();
+
+        assertThat(first.broadcasterId()).isEqualTo("owner-a");
+        assertThat(second.broadcasterId()).isEqualTo("owner-b");
+        assertThat(third.broadcasterId()).isEqualTo("owner-a");
+        assertThat(first.generation()).isLessThan(second.generation());
+        assertThat(second.generation()).isLessThan(third.generation());
+        assertThat(first).isNotEqualTo(third);
         twitchServer.verify();
     }
 

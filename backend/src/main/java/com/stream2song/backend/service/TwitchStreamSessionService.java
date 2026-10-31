@@ -3,28 +3,40 @@ package com.stream2song.backend.service;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.springframework.stereotype.Service;
 
 import com.stream2song.backend.model.StreamSessionState;
 
 @Service
 public class TwitchStreamSessionService {
+    private static final Logger log = LoggerFactory.getLogger(TwitchStreamSessionService.class);
     private final AtomicReference<StreamSessionState> current = new AtomicReference<>();
 
-    public void recordOnline(String broadcasterId, String streamId, Instant startedAt) {
-        current.updateAndGet(previous -> {
-            if (isOlderThanCurrent(broadcasterId, startedAt, previous)) return previous;
-            return new StreamSessionState(broadcasterId, streamId, "stream.online", startedAt, true);
-        });
+    public synchronized void recordOnline(String broadcasterId, String streamId, Instant startedAt) {
+        StreamSessionState previous = current.get();
+        if (isOlderThanCurrent(broadcasterId, startedAt, previous)) return;
+        current.set(new StreamSessionState(broadcasterId, streamId, "stream.online", startedAt, true, startedAt));
+        if (previous == null || !previous.online() || !streamId.equals(previous.twitchStreamId())) {
+            log.info("Twitch stream online: broadcasterId={} streamId={} eventTimestamp={}",
+                    broadcasterId, streamId, startedAt);
+        }
     }
 
-    public void recordOffline(String broadcasterId, Instant eventTimestamp) {
-        current.updateAndGet(previous -> {
-            if (isOlderThanCurrent(broadcasterId, eventTimestamp, previous)) return previous;
-            String lastStreamId = previous != null && previous.broadcasterId().equals(broadcasterId)
-                    ? previous.twitchStreamId() : null;
-            return new StreamSessionState(broadcasterId, lastStreamId, "stream.offline", eventTimestamp, false);
-        });
+    public synchronized void recordOffline(String broadcasterId, Instant eventTimestamp) {
+        StreamSessionState previous = current.get();
+        if (isOlderThanCurrent(broadcasterId, eventTimestamp, previous)) return;
+        String lastStreamId = previous != null && previous.broadcasterId().equals(broadcasterId)
+                ? previous.twitchStreamId() : null;
+        Instant startedAt = previous != null && previous.broadcasterId().equals(broadcasterId)
+                ? previous.streamStartedAt() : null;
+        current.set(new StreamSessionState(broadcasterId, lastStreamId, "stream.offline", eventTimestamp, false, startedAt));
+        if (previous == null || previous.online()) {
+            log.info("Twitch stream offline: broadcasterId={} streamId={} eventTimestamp={}",
+                    broadcasterId, lastStreamId, eventTimestamp);
+        }
     }
 
     public StreamSessionState currentFor(String broadcasterId) {

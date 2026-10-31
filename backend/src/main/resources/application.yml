@@ -2,6 +2,19 @@ spring:
   application:
     name: stream2song-backend
 
+logging:
+  level:
+    root: INFO
+    com.stream2song.backend: ${STREAM2SONG_LOG_LEVEL:INFO}
+  file:
+    name: logs/stream2song.log
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 14
+      total-size-cap: 200MB
+      clean-history-on-start: false
+
 server:
   port: 8080
   servlet:
@@ -19,3 +32,21 @@ twitch:
   eventsub:
     callback-url: ${TWITCH_EVENTSUB_CALLBACK_URL:}
     signing-secret: ${TWITCH_EVENTSUB_SIGNING_SECRET:}
+
+deepgram:
+  api-key: ${DEEPGRAM_API_KEY:}
+openai:
+  api-key: ${OPENAI_API_KEY:}
+  model: ${OPENAI_MODEL:gpt-6-luna}
+  spoken:
+    model: ${OPENAI_SPOKEN_MODEL:gpt-realtime-2.1-mini}
+    voice: ${OPENAI_SPOKEN_VOICE:marin}
+music:
+  enabled: ${MUSIC_ENABLED:false}
+  provider: ${MUSIC_PROVIDER:replicate}
+  replicate-api-token: ${REPLICATE_API_TOKEN:}
+clip:
+  transcription:
+    cache:
+      ttl-seconds: ${CLIP_TRANSCRIPTION_CACHE_TTL_SECONDS:1800}
+      max-entries: ${CLIP_TRANSCRIPTION_CACHE_MAX_ENTRIES:100}

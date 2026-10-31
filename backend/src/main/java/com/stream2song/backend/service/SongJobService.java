@@ -7,6 +7,9 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.springframework.stereotype.Service;
 
 import com.stream2song.backend.exception.SongJobNotFoundException;
@@ -14,11 +17,13 @@ import com.stream2song.backend.model.SongJob;
 
 @Service
 public class SongJobService {
+    private static final Logger log = LoggerFactory.getLogger(SongJobService.class);
     private final Map<UUID, SongJob> jobs = new ConcurrentHashMap<>();
 
     public SongJob create(String channelName) {
         SongJob job = new SongJob(UUID.randomUUID(), channelName, SongJob.Status.PENDING, Instant.now());
         jobs.put(job.id(), job);
+        log.info("Song job created: jobId={} channelName={} status={}", job.id(), job.channelName(), job.status());
         return job;
     }
 

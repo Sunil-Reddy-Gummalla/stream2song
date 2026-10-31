@@ -29,7 +29,7 @@ class TwitchChatCollectionServiceTest {
         TwitchEventSubProperties eventSub = new TwitchEventSubProperties(
                 "https://tunnel.example/api/twitch/eventsub/webhook", "test-signing-secret-123");
         TwitchEventSubSubscriptionService subscriptions = new TwitchEventSubSubscriptionService(
-                oauth, eventSub, registry, restTemplate);
+                oauth, eventSub, registry, new TwitchAppAccessTokenService(oauth, restTemplate), restTemplate);
         TwitchStreamSessionService sessions = new TwitchStreamSessionService();
         sessions.recordOnline("broadcaster-42", "stale-stream", Instant.parse("2026-10-26T09:00:00Z"));
         TwitchChatCollectionService collection = new TwitchChatCollectionService(
